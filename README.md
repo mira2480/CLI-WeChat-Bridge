@@ -1,4 +1,5 @@
-# CLI WeChat Bridge
+# CLI WeChat Bridge 
+**命令行工具的微信桥接**
 
 > Platform support:
 > - Windows: primary validated native platform.
@@ -7,11 +8,11 @@
 
 将微信接入本地 AI 编码工作流的桥接工具。
 
-本项目用于桥接微信消息与本地运行的 `codex`、`claude` 或持久化 `powershell.exe` 会话，并将本地输出、审批请求与运行状态同步回微信。当前实现以 `codex` 工作流为中心展开，重点是保留本地原生终端体验，并在此基础上提供微信侧的远程输入、结果回流与状态同步能力。
+本项目用于桥接微信消息与本地运行的 [`codex`](https://github.com/openai/codex)、[`Claude Code`](https://code.claude.com/docs/en/overview) 或持久化 `powershell.exe` 会话，并将本地输出、审批请求与运行状态同步回微信。当前实现以 `codex` 工作流为中心展开，重点是保留本地原生终端体验，并在此基础上提供微信侧的远程输入、结果回流与状态同步能力。
 
 > 当前支持状态说明  
-> - `codex`：当前优先支持的适配器，功能链路最完整，完成度最高  
-> - `claude code`：已接入基础桥接，但受当前 channels 链路与交互模型限制，尚未完善  
+> - `codex`：当前优先支持的适配器，功能链路最完整，完成度最高（也许是目前最接近原生体验的项目）
+> - `claude code`：已接入基础桥接，但受当前 channels 链路与交互模型限制，尚未完善（目前还是channels功能较为完善，但是由于权限灰度测试，此仓库暂时没有完善）
 > - `shell`：可用，适合持久化 PowerShell 会话桥接
 
 ## 这个项目解决什么问题
@@ -33,11 +34,11 @@
 ### 环境要求
 
 - Windows 为当前主要验证环境
-- Node.js `>= 24.0.0`
-- Bun `>= 1.0.0`
+- [Node.js](https://nodejs.org/en/download) `>= 24.0.0`（建议直接安装官网 LTS 版本）
+- [Bun](https://bun.sh/docs/installation) `>= 1.0.0`
 - 已安装以下至少一种本地 CLI：
-  - `codex`
-  - `claude`
+  - [`codex`](https://github.com/openai/codex)
+  - [`claude`](https://code.claude.com/docs/en/overview)
   - `powershell.exe`
 
 ### 1. 克隆仓库并安装依赖
@@ -76,9 +77,12 @@ bun run setup
 该流程会：
 
 1. 获取微信登录二维码
-2. 在终端打印二维码
+2. 选择 y 确认，在终端打印二维码
 3. 等待你在微信中扫码并确认
 4. 将 bot 凭据写入本地数据目录
+
+![alt text](src/image-0.png)
+
 
 默认凭据文件路径：
 
@@ -92,36 +96,41 @@ bun run setup
 - `account.json.userId` 对应的微信账号即为唯一授权 owner
 - 只有该账号发送的消息会被 bridge 接受
 
-### 4. 启动 `codex` 模式
+### 4. 启动 `codex` 模式（目前实现的核心）
 
 假设你的项目目录是：
 
 ```bash
-cd D:\work\my-project
+cd D:\work\your-project
 ```
 
-终端 A：
+终端 A：（这是用于监听和服务的，先打开这个）
 
 ```bash
 wechat-bridge-codex
 ```
+![alt text](src/image-1.png)
 
-终端 B：
+终端 B：（再新开一个窗口,运行以下命令，近乎原生的codex)
 
 ```bash
 wechat-codex
 ```
 
-然后即可：
+![alt text](src/image-2.png)
+
+然后即可：（允许双向交互！）
 
 - 在微信中发送普通文本
 - 在本地 `wechat-codex` 中继续原生交互
 - 在本地执行 `/resume` 切线程
 - 让微信自动跟随当前本地线程
 
+![alt text](src/image-3.png)
+
 如果你第一次使用本项目，建议优先从 `codex` 模式开始。当前仓库中，`codex` 是实现最完整、会话一致性与本地/远程衔接能力最完善的适配器路径。
 
-### 5. 启动其他模式
+### 5. 启动其他模式（暂待完善）
 
 `claude`：
 
@@ -470,7 +479,7 @@ bun test
 
 ## 运行时说明
 
-在 Windows 上，交互式 `node-pty`、ConPTY 以及相关 CLI 进程管理在 Node.js 下比 Bun 更稳定，尤其体现在：
+在 Windows 上，交互式 [`node-pty`](https://github.com/microsoft/node-pty)、ConPTY 以及相关 CLI 进程管理在 [Node.js](https://nodejs.org/en/download) 下比 [Bun](https://bun.sh/docs/installation) 更稳定，尤其体现在：
 
 - `codex`
 - `claude`
@@ -482,6 +491,18 @@ bun test
 - 正式 bridge 运行时默认使用 Node.js
 - `bun run bridge:*` 仍然是仓库内开发入口
 
-## License
+如果你还没有安装运行时，请直接使用前文“相关链接”中的 Node.js 下载页和 Bun 安装文档。
 
+## 致谢
+
+本项目直接依赖并集成了以下开源项目：
+
+- [openclaw-weixin](https://github.com/hao-ji-xing/openclaw-weixin)：部分微信 ClawBot 的源码,感谢开源！
+
+- [@modelcontextprotocol/sdk](https://github.com/modelcontextprotocol/typescript-sdk)：TypeScript 版 MCP SDK
+- [node-pty](https://github.com/microsoft/node-pty)：本地 PTY / ConPTY 进程桥接
+- [@anthropic-ai/sdk](https://github.com/anthropics/anthropic-sdk-typescript)：Anthropic TypeScript SDK
+- [qrcode-terminal](https://github.com/gtanner/qrcode-terminal)：终端二维码输出
+
+## License
 MIT
