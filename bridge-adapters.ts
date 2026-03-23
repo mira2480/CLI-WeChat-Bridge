@@ -116,6 +116,7 @@ const CODEX_SESSION_FALLBACK_SCAN_INTERVAL_MS = 5_000;
 const CODEX_THREAD_SIGNAL_TTL_MS = 30_000;
 const CODEX_RECENT_SESSION_KEY_LIMIT = 64;
 const INTERRUPT_SETTLE_DELAY_MS = 1_500;
+const CODEX_FINAL_REPLY_SETTLE_DELAY_MS = 1_000;
 const CODEX_STARTUP_WARMUP_MS = 1_200;
 const CODEX_APP_SERVER_HOST = "127.0.0.1";
 const CODEX_APP_SERVER_READY_TIMEOUT_MS = 10_000;
@@ -381,6 +382,48 @@ export function shouldIgnoreCodexSessionReplayEntry(
   }
 
   return parsedTimestampMs < ignoreBeforeMs;
+}
+
+export function shouldRecoverCodexStaleBusyState(params: {
+  status: BridgeAdapterState["status"];
+  pendingTurnStart: boolean;
+  hasActiveTurn: boolean;
+  hasPendingApproval: boolean;
+  activeTurnId?: string;
+}): boolean {
+  return (
+    params.status === "busy" &&
+    !params.pendingTurnStart &&
+    !params.hasActiveTurn &&
+    !params.hasPendingApproval &&
+    !params.activeTurnId
+  );
+}
+
+export function shouldAutoCompleteCodexWechatTurnAfterFinalReply(params: {
+  candidateTurnId: string | null;
+  activeTurnId?: string;
+  activeTurnOrigin?: BridgeTurnOrigin;
+  pendingTurnStart: boolean;
+  hasPendingApproval: boolean;
+  hasFinalOutput: boolean;
+  hasCompletedTurn: boolean;
+  lastActivityAtMs: number | null;
+  nowMs: number;
+  settleDelayMs: number;
+}): boolean {
+  return (
+    typeof params.candidateTurnId === "string" &&
+    params.activeTurnId === params.candidateTurnId &&
+    params.activeTurnOrigin === "wechat" &&
+    !params.pendingTurnStart &&
+    !params.hasPendingApproval &&
+    params.hasFinalOutput &&
+    !params.hasCompletedTurn &&
+    typeof params.lastActivityAtMs === "number" &&
+    Number.isFinite(params.lastActivityAtMs) &&
+    params.nowMs - params.lastActivityAtMs >= params.settleDelayMs
+  );
 }
 
 function getEnvValue(
@@ -1774,6 +1817,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
   private turnFinalMessages = new Map<string, Map<string, string>>();
   private turnDeltaByItem = new Map<string, Map<string, string>>();
   private turnErrorById = new Map<string, string>();
+  private turnLastActivityAtMs = new Map<string, number>();
   private startupBlocker: string | null = null;
   private warmupUntilMs = 0;
   private sessionFilePath: string | null = null;
@@ -1792,6 +1836,8 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
   }> = [];
   private localInputListener: ((chunk: string | Buffer) => void) | null = null;
   private interruptTimer: ReturnType<typeof setTimeout> | null = null;
+  private finalReplyCompletionTimer: ReturnType<typeof setTimeout> | null = null;
+  private finalReplyCompletionTurnId: string | null = null;
   private resumeThreadId: string | null;
 
   constructor(options: AdapterOptions) {
@@ -2281,9 +2327,19 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     switch (payload.type) {
       case "task_started": {
         if (typeof payload.turn_id === "string") {
+          this.recordTurnActivity(payload.turn_id, timestamp);
           this.hasAcceptedInput = true;
           this.state.activeTurnId = payload.turn_id;
-          if (this.state.status !== "busy" && this.state.status !== "awaiting_approval") {
+          const hasTrackedTurnContext =
+            this.pendingTurnStart ||
+            Boolean(this.activeTurn) ||
+            this.state.activeTurnOrigin === "local" ||
+            this.state.activeTurnOrigin === "wechat";
+          if (
+            hasTrackedTurnContext &&
+            this.state.status !== "busy" &&
+            this.state.status !== "awaiting_approval"
+          ) {
             const message =
               this.state.activeTurnOrigin === "local"
                 ? "Codex is busy with a local terminal turn."
@@ -2350,6 +2406,11 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
         if (message) {
           this.sessionFinalText = message;
           this.state.lastOutputAt = timestamp;
+          const activeTurnId = this.activeTurn?.turnId ?? this.state.activeTurnId ?? null;
+          if (activeTurnId) {
+            this.recordTurnActivity(activeTurnId, timestamp);
+            this.scheduleFinalReplyCompletionIfEligible(activeTurnId);
+          }
         }
         return;
       }
@@ -2358,12 +2419,14 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
         if (typeof payload.turn_id !== "string") {
           return;
         }
+        this.clearFinalReplyCompletionTimerForTurn(payload.turn_id);
 
         if (this.hasCompletedTurn(payload.turn_id)) {
           this.sessionFinalText = null;
           if (this.activeTurn?.turnId === payload.turn_id) {
             this.setActiveTurn(null);
           }
+          this.cleanupTurnArtifacts(payload.turn_id);
           if (this.state.status !== "stopped") {
             this.setStatus("idle");
           }
@@ -2375,9 +2438,25 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
           (typeof payload.last_agent_message === "string"
             ? normalizeOutput(payload.last_agent_message).trim()
             : "");
-        const completionOrigin = this.state.activeTurnOrigin;
+        const completionOrigin =
+          this.activeTurn?.turnId === payload.turn_id
+            ? this.activeTurn.origin
+            : this.state.activeTurnOrigin;
         this.sessionFinalText = null;
+
+        if (this.activeTurn?.turnId === payload.turn_id) {
+          this.setActiveTurn(null);
+        } else if (this.state.activeTurnId === payload.turn_id) {
+          this.state.activeTurnId = undefined;
+          this.state.activeTurnOrigin = undefined;
+        }
+
         this.clearPendingApprovalState();
+        this.cleanupTurnArtifacts(payload.turn_id);
+
+        if (this.state.status !== "stopped") {
+          this.setStatus("idle");
+        }
 
         if (finalText) {
           this.emit({
@@ -2385,10 +2464,6 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
             text: finalText,
             timestamp,
           });
-        }
-
-        if (this.state.status !== "stopped") {
-          this.setStatus("idle");
         }
 
         this.emit({
@@ -2401,8 +2476,6 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
         });
 
         this.rememberCompletedTurn(payload.turn_id);
-        this.state.activeTurnId = undefined;
-        this.state.activeTurnOrigin = undefined;
         return;
       }
     }
@@ -2461,6 +2534,8 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     if (!this.nativeProcess) {
       throw new Error("codex panel is not running.");
     }
+    this.recoverStaleBusyStateIfNeeded();
+    this.recoverStaleActiveTurnStateIfNeeded();
     if (this.pendingApproval) {
       throw new Error("A Codex approval request is pending. Reply with /confirm <code> or /deny.");
     }
@@ -3004,8 +3079,49 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     this.interruptTimer = null;
   }
 
+  private recoverStaleBusyStateIfNeeded(): void {
+    if (
+      !shouldRecoverCodexStaleBusyState({
+        status: this.state.status,
+        pendingTurnStart: this.pendingTurnStart,
+        hasActiveTurn: Boolean(this.activeTurn),
+        hasPendingApproval: Boolean(this.pendingApproval || this.pendingApprovalRequest),
+        activeTurnId: this.state.activeTurnId,
+      })
+    ) {
+      return;
+    }
+
+    this.pendingTurnStart = false;
+    this.pendingTurnThreadId = null;
+    this.interruptPendingTurnStart = false;
+    this.state.activeTurnId = undefined;
+    this.state.activeTurnOrigin = undefined;
+    this.clearInterruptTimer();
+    this.setStatus("idle", "Recovered stale busy state.");
+  }
+
+  private recoverStaleActiveTurnStateIfNeeded(): void {
+    if (
+      !this.activeTurn ||
+      this.pendingTurnStart ||
+      this.pendingApproval ||
+      this.pendingApprovalRequest ||
+      this.state.status === "busy" ||
+      this.state.status === "awaiting_approval" ||
+      this.state.activeTurnId
+    ) {
+      return;
+    }
+
+    this.cleanupTurnArtifacts(this.activeTurn.turnId);
+    this.setActiveTurn(null);
+    this.clearInterruptTimer();
+  }
+
   private resetTurnTracking(options: { preserveThread: boolean }): void {
     this.clearInterruptTimer();
+    this.clearFinalReplyCompletionTimer();
     if (this.activeTurn) {
       this.cleanupTurnArtifacts(this.activeTurn.turnId);
     }
@@ -3020,6 +3136,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     this.turnFinalMessages.clear();
     this.turnDeltaByItem.clear();
     this.turnErrorById.clear();
+    this.turnLastActivityAtMs.clear();
     this.mirroredUserInputTurnIds.clear();
     this.bridgeOwnedTurnIds.clear();
     this.completedTurnIds.clear();
@@ -3121,9 +3238,11 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
   }
 
   private cleanupTurnArtifacts(turnId: string): void {
+    this.clearFinalReplyCompletionTimerForTurn(turnId);
     this.turnFinalMessages.delete(turnId);
     this.turnDeltaByItem.delete(turnId);
     this.turnErrorById.delete(turnId);
+    this.turnLastActivityAtMs.delete(turnId);
     this.mirroredUserInputTurnIds.delete(turnId);
     this.bridgeOwnedTurnIds.delete(turnId);
   }
@@ -3351,6 +3470,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     trackedTurn: CodexActiveTurn,
   ): void {
     this.state.lastOutputAt = nowIso();
+    this.recordTurnActivity(trackedTurn.turnId);
     this.handleTrackedTurnStarted(trackedTurn);
 
     switch (method) {
@@ -3381,6 +3501,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
         const finalText = extractCodexFinalTextFromItem(params.item);
         if (itemId && finalText) {
           this.getTurnFinalMessageMap(trackedTurn.turnId).set(itemId, finalText);
+          this.scheduleFinalReplyCompletionIfEligible(trackedTurn.turnId);
         }
         return;
       }
@@ -3409,6 +3530,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
       }
 
       case "turn/completed": {
+        this.clearFinalReplyCompletionTimerForTurn(trackedTurn.turnId);
         this.handleTurnCompleted(trackedTurn, params);
         return;
       }
@@ -3593,6 +3715,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     trackedTurn: CodexActiveTurn,
     params: Record<string, unknown>,
   ): void {
+    this.clearFinalReplyCompletionTimerForTurn(trackedTurn.turnId);
     if (this.hasCompletedTurn(trackedTurn.turnId)) {
       if (this.activeTurn?.turnId === trackedTurn.turnId) {
         this.setActiveTurn(null);
@@ -3628,6 +3751,15 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     }
     this.cleanupTurnArtifacts(trackedTurn.turnId);
 
+    if (
+      this.state.status !== "stopped" &&
+      (!this.activeTurn || this.activeTurn.turnId === trackedTurn.turnId)
+    ) {
+      const statusMessage =
+        status === "interrupted" ? "Codex task interrupted." : undefined;
+      this.setStatus("idle", statusMessage);
+    }
+
     if (finalText) {
       this.emit({
         type: "stdout",
@@ -3643,15 +3775,6 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
         text: failureText,
         timestamp: nowIso(),
       });
-    }
-
-    if (
-      this.state.status !== "stopped" &&
-      (!this.activeTurn || this.activeTurn.turnId === trackedTurn.turnId)
-    ) {
-      const statusMessage =
-        status === "interrupted" ? "Codex task interrupted." : undefined;
-      this.setStatus("idle", statusMessage);
     }
     this.emit({
       type: "task_complete",
@@ -3695,6 +3818,117 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     }
 
     return deltaFallback[deltaFallback.length - 1];
+  }
+
+  private recordTurnActivity(turnId: string, timestamp: string | number = Date.now()): void {
+    const timestampMs =
+      typeof timestamp === "number" ? timestamp : Date.parse(timestamp);
+    this.turnLastActivityAtMs.set(
+      turnId,
+      Number.isFinite(timestampMs) ? timestampMs : Date.now(),
+    );
+  }
+
+  private clearFinalReplyCompletionTimer(): void {
+    if (this.finalReplyCompletionTimer) {
+      clearTimeout(this.finalReplyCompletionTimer);
+      this.finalReplyCompletionTimer = null;
+    }
+    this.finalReplyCompletionTurnId = null;
+  }
+
+  private clearFinalReplyCompletionTimerForTurn(turnId: string): void {
+    if (this.finalReplyCompletionTurnId !== turnId) {
+      return;
+    }
+    this.clearFinalReplyCompletionTimer();
+  }
+
+  private scheduleFinalReplyCompletionIfEligible(turnId: string): void {
+    if (
+      !this.activeTurn ||
+      this.activeTurn.turnId !== turnId ||
+      this.activeTurn.origin !== "wechat" ||
+      this.pendingTurnStart ||
+      this.pendingApproval ||
+      this.pendingApprovalRequest ||
+      !this.collectTurnOutput(turnId)
+    ) {
+      return;
+    }
+
+    this.clearFinalReplyCompletionTimer();
+    this.finalReplyCompletionTurnId = turnId;
+    this.finalReplyCompletionTimer = setTimeout(() => {
+      this.autoCompleteWechatTurnAfterFinalReply(turnId);
+    }, CODEX_FINAL_REPLY_SETTLE_DELAY_MS);
+    this.finalReplyCompletionTimer.unref?.();
+  }
+
+  private autoCompleteWechatTurnAfterFinalReply(turnId: string): void {
+    this.clearFinalReplyCompletionTimerForTurn(turnId);
+
+    const activeTurn = this.activeTurn;
+    const finalText = this.collectTurnOutput(turnId);
+    const lastActivityAtMs = this.turnLastActivityAtMs.get(turnId) ?? null;
+    const pendingApproval = Boolean(this.pendingApproval || this.pendingApprovalRequest);
+    const nowMs = Date.now();
+    if (
+      !shouldAutoCompleteCodexWechatTurnAfterFinalReply({
+        candidateTurnId: turnId,
+        activeTurnId: activeTurn?.turnId,
+        activeTurnOrigin: activeTurn?.origin,
+        pendingTurnStart: this.pendingTurnStart,
+        hasPendingApproval: pendingApproval,
+        hasFinalOutput: Boolean(finalText),
+        hasCompletedTurn: this.hasCompletedTurn(turnId),
+        lastActivityAtMs,
+        nowMs,
+        settleDelayMs: CODEX_FINAL_REPLY_SETTLE_DELAY_MS,
+      })
+    ) {
+      if (
+        activeTurn?.turnId === turnId &&
+        activeTurn.origin === "wechat" &&
+        !this.pendingTurnStart &&
+        !pendingApproval &&
+        finalText &&
+        typeof lastActivityAtMs === "number"
+      ) {
+        const remainingMs = CODEX_FINAL_REPLY_SETTLE_DELAY_MS - (nowMs - lastActivityAtMs);
+        if (remainingMs > 0) {
+          this.finalReplyCompletionTurnId = turnId;
+          this.finalReplyCompletionTimer = setTimeout(() => {
+            this.autoCompleteWechatTurnAfterFinalReply(turnId);
+          }, remainingMs);
+          this.finalReplyCompletionTimer.unref?.();
+        }
+      }
+      return;
+    }
+
+    if (!activeTurn || !finalText) {
+      return;
+    }
+
+    this.clearPendingApprovalState();
+    this.setActiveTurn(null);
+    this.cleanupTurnArtifacts(turnId);
+    this.state.lastOutputAt = nowIso();
+    if (this.state.status !== "stopped") {
+      this.setStatus("idle", "Recovered delayed Codex completion after final reply.");
+    }
+    this.emit({
+      type: "stdout",
+      text: finalText,
+      timestamp: nowIso(),
+    });
+    this.emit({
+      type: "task_complete",
+      summary: this.currentPreview,
+      timestamp: nowIso(),
+    });
+    this.rememberCompletedTurn(turnId);
   }
 
   private async stopAppServer(): Promise<void> {

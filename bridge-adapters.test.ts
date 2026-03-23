@@ -7,6 +7,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
   buildCodexCliArgs,
   buildCodexApprovalRequest,
+  createBridgeAdapter,
   extractCodexFinalTextFromItem,
   extractCodexThreadFollowIdFromStatusChanged,
   extractCodexThreadStartedThreadId,
@@ -15,7 +16,9 @@ import {
   listCodexResumeThreads,
   matchesCodexSessionMeta,
   resolveSpawnTarget,
+  shouldAutoCompleteCodexWechatTurnAfterFinalReply,
   shouldIgnoreCodexSessionReplayEntry,
+  shouldRecoverCodexStaleBusyState,
 } from "./bridge-adapters.ts";
 
 const tempDirectories: string[] = [];
@@ -447,6 +450,203 @@ describe("shouldIgnoreCodexSessionReplayEntry", () => {
 
     expect(shouldIgnoreCodexSessionReplayEntry(undefined, cutoff)).toBe(true);
     expect(shouldIgnoreCodexSessionReplayEntry(undefined, null)).toBe(false);
+  });
+});
+
+describe("shouldRecoverCodexStaleBusyState", () => {
+  test("recovers when busy is set without any tracked turn context", () => {
+    expect(
+      shouldRecoverCodexStaleBusyState({
+        status: "busy",
+        pendingTurnStart: false,
+        hasActiveTurn: false,
+        hasPendingApproval: false,
+      }),
+    ).toBe(true);
+  });
+
+  test("does not recover when a turn is still active or pending", () => {
+    expect(
+      shouldRecoverCodexStaleBusyState({
+        status: "busy",
+        pendingTurnStart: true,
+        hasActiveTurn: false,
+        hasPendingApproval: false,
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldRecoverCodexStaleBusyState({
+        status: "busy",
+        pendingTurnStart: false,
+        hasActiveTurn: true,
+        hasPendingApproval: false,
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldRecoverCodexStaleBusyState({
+        status: "busy",
+        pendingTurnStart: false,
+        hasActiveTurn: false,
+        hasPendingApproval: true,
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldRecoverCodexStaleBusyState({
+        status: "busy",
+        pendingTurnStart: false,
+        hasActiveTurn: false,
+        hasPendingApproval: false,
+        activeTurnId: "turn_123",
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("shouldAutoCompleteCodexWechatTurnAfterFinalReply", () => {
+  test("auto-completes a settled WeChat turn once final output is available", () => {
+    expect(
+      shouldAutoCompleteCodexWechatTurnAfterFinalReply({
+        candidateTurnId: "turn_123",
+        activeTurnId: "turn_123",
+        activeTurnOrigin: "wechat",
+        pendingTurnStart: false,
+        hasPendingApproval: false,
+        hasFinalOutput: true,
+        hasCompletedTurn: false,
+        lastActivityAtMs: 1_000,
+        nowMs: 2_100,
+        settleDelayMs: 1_000,
+      }),
+    ).toBe(true);
+  });
+
+  test("does not auto-complete local, incomplete, or still-active turns", () => {
+    expect(
+      shouldAutoCompleteCodexWechatTurnAfterFinalReply({
+        candidateTurnId: "turn_123",
+        activeTurnId: "turn_123",
+        activeTurnOrigin: "local",
+        pendingTurnStart: false,
+        hasPendingApproval: false,
+        hasFinalOutput: true,
+        hasCompletedTurn: false,
+        lastActivityAtMs: 1_000,
+        nowMs: 2_100,
+        settleDelayMs: 1_000,
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldAutoCompleteCodexWechatTurnAfterFinalReply({
+        candidateTurnId: "turn_123",
+        activeTurnId: "turn_123",
+        activeTurnOrigin: "wechat",
+        pendingTurnStart: false,
+        hasPendingApproval: true,
+        hasFinalOutput: true,
+        hasCompletedTurn: false,
+        lastActivityAtMs: 1_000,
+        nowMs: 2_100,
+        settleDelayMs: 1_000,
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldAutoCompleteCodexWechatTurnAfterFinalReply({
+        candidateTurnId: "turn_123",
+        activeTurnId: "turn_123",
+        activeTurnOrigin: "wechat",
+        pendingTurnStart: false,
+        hasPendingApproval: false,
+        hasFinalOutput: true,
+        hasCompletedTurn: false,
+        lastActivityAtMs: 1_500,
+        nowMs: 2_100,
+        settleDelayMs: 1_000,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("Codex panel completion recovery", () => {
+  test("session task_complete clears the in-memory active turn and returns to idle", () => {
+    const adapter = createBridgeAdapter({
+      kind: "codex",
+      command: "codex",
+      cwd: process.cwd(),
+      renderMode: "panel",
+    }) as any;
+    const events: Array<{ type: string }> = [];
+    adapter.setEventSink((event: { type: string }) => events.push(event));
+    adapter.activeTurn = {
+      threadId: "thread_1",
+      turnId: "turn_1",
+      origin: "wechat",
+    };
+    adapter.state.status = "busy";
+    adapter.state.activeTurnId = "turn_1";
+    adapter.state.activeTurnOrigin = "wechat";
+
+    adapter.handleSessionLogLine(
+      JSON.stringify({
+        timestamp: "2026-03-23T10:00:00.000Z",
+        payload: {
+          type: "task_complete",
+          turn_id: "turn_1",
+          last_agent_message: "done",
+        },
+      }),
+    );
+
+    expect(adapter.activeTurn).toBeNull();
+    expect(adapter.state.status).toBe("idle");
+    expect(adapter.state.activeTurnId).toBeUndefined();
+    expect(adapter.state.activeTurnOrigin).toBeUndefined();
+    expect(events.map((event) => event.type)).toEqual(["status", "stdout", "task_complete"]);
+  });
+
+  test("sendInput recovers a stale hidden active turn before starting the next WeChat turn", async () => {
+    const adapter = createBridgeAdapter({
+      kind: "codex",
+      command: "codex",
+      cwd: process.cwd(),
+      renderMode: "panel",
+    }) as any;
+
+    adapter.nativeProcess = {};
+    adapter.activeTurn = {
+      threadId: "thread_1",
+      turnId: "turn_stale",
+      origin: "wechat",
+    };
+    adapter.state.status = "idle";
+    adapter.state.activeTurnId = undefined;
+    adapter.state.activeTurnOrigin = undefined;
+    adapter.pendingTurnStart = false;
+    adapter.pendingApproval = null;
+    adapter.pendingApprovalRequest = null;
+    adapter.ensureThreadStarted = async () => "thread_1";
+    adapter.sendRpcRequest = async (method: string) => {
+      expect(method).toBe("turn/start");
+      return {
+        turn: {
+          id: "turn_2",
+        },
+      };
+    };
+
+    await adapter.sendInput("hello");
+
+    expect(adapter.activeTurn).toEqual({
+      threadId: "thread_1",
+      turnId: "turn_2",
+      origin: "wechat",
+    });
+    expect(adapter.state.activeTurnId).toBe("turn_2");
+    expect(adapter.state.activeTurnOrigin).toBe("wechat");
   });
 });
 
