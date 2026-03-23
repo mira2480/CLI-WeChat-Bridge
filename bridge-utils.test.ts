@@ -6,6 +6,7 @@ import {
   detectCliApproval,
   formatResumeThreadList,
   formatStatusReport,
+  formatThreadSwitchMessage,
   isHighRiskShellCommand,
   MESSAGE_START_GRACE_MS,
   OutputBatcher,
@@ -156,6 +157,9 @@ describe("formatStatusReport", () => {
       cwd: "C:\\repo",
       command: "codex",
       sharedThreadId: "thread_123",
+      lastThreadSwitchAt: "2026-03-23T12:05:00.000Z",
+      lastThreadSwitchSource: "local",
+      lastThreadSwitchReason: "local_follow",
       activeTurnId: "turn_456",
       activeTurnOrigin: "local",
       pendingApprovalOrigin: "local",
@@ -163,6 +167,12 @@ describe("formatStatusReport", () => {
 
     expect(formatStatusReport(bridgeState, adapterState)).toContain(
       "shared_thread_id: thread_123",
+    );
+    expect(formatStatusReport(bridgeState, adapterState)).toContain(
+      "last_thread_switch_source: local",
+    );
+    expect(formatStatusReport(bridgeState, adapterState)).toContain(
+      "last_thread_switch_reason: local_follow",
     );
     expect(formatStatusReport(bridgeState, adapterState)).toContain(
       "persisted_shared_thread_id: thread_persisted",
@@ -173,6 +183,28 @@ describe("formatStatusReport", () => {
     expect(formatStatusReport(bridgeState, adapterState)).toContain(
       "pending_approval_origin: local",
     );
+  });
+});
+
+describe("formatThreadSwitchMessage", () => {
+  test("formats local thread-follow notices for WeChat", () => {
+    expect(
+      formatThreadSwitchMessage({
+        threadId: "thread_local_123456",
+        source: "local",
+        reason: "local_follow",
+      }),
+    ).toContain("from the local terminal");
+  });
+
+  test("formats startup restore notices", () => {
+    expect(
+      formatThreadSwitchMessage({
+        threadId: "thread_restore_123456",
+        source: "restore",
+        reason: "startup_restore",
+      }),
+    ).toContain("restored shared thread");
   });
 });
 

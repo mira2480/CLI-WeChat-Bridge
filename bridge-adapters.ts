@@ -23,6 +23,8 @@ import type {
   BridgeResumeThreadCandidate,
   BridgeAdapterState,
   BridgeEvent,
+  BridgeThreadSwitchReason,
+  BridgeThreadSwitchSource,
   BridgeTurnOrigin,
 } from "./bridge-types.ts";
 import {
@@ -2587,7 +2589,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     try {
       await this.resumeSharedThread(threadId, { startup: true });
     } catch (error) {
-      this.setSharedThreadId(null);
+      this.updateSharedThread(null);
       this.emit({
         type: "status",
         status: "starting",
@@ -2617,7 +2619,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
       throw new Error("Codex did not return a thread id for the bridge session.");
     }
 
-    this.setSharedThreadId(threadId);
+    this.updateSharedThread(threadId);
     return threadId;
   }
 
@@ -2662,7 +2664,11 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     this.sessionPartialLine = "";
     this.sessionFinalText = null;
     this.pendingThreadFollowId = null;
-    this.setSharedThreadId(resumedThreadId);
+    this.updateSharedThread(resumedThreadId, {
+      source: options.startup ? "restore" : "wechat",
+      reason: options.startup ? "startup_restore" : "wechat_resume",
+      notify: Boolean(options.startup),
+    });
   }
 
   private extractThreadIdFromResponse(response: unknown): string | null {
@@ -2760,14 +2766,36 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     this.state.activeTurnId = undefined;
     this.state.activeTurnOrigin = undefined;
     if (!options.preserveThread) {
-      this.setSharedThreadId(null);
+      this.updateSharedThread(null);
     }
   }
 
-  private setSharedThreadId(threadId: string | null): void {
+  private updateSharedThread(
+    threadId: string | null,
+    options: {
+      source?: BridgeThreadSwitchSource;
+      reason?: BridgeThreadSwitchReason;
+      notify?: boolean;
+    } = {},
+  ): void {
     const previousThreadId = this.sharedThreadId;
     this.sharedThreadId = threadId;
     this.state.sharedThreadId = threadId ?? undefined;
+    if (threadId && options.source && options.reason) {
+      const switchedAt = nowIso();
+      this.state.lastThreadSwitchAt = switchedAt;
+      this.state.lastThreadSwitchSource = options.source;
+      this.state.lastThreadSwitchReason = options.reason;
+      if (options.notify && previousThreadId !== threadId) {
+        this.emit({
+          type: "thread_switched",
+          threadId,
+          source: options.source,
+          reason: options.reason,
+          timestamp: switchedAt,
+        });
+      }
+    }
     if (previousThreadId !== threadId) {
       this.sessionFilePath = null;
       this.sessionReadOffset = 0;
@@ -2785,11 +2813,14 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     this.activeTurn = activeTurn;
     this.state.activeTurnId = activeTurn?.turnId;
     this.state.activeTurnOrigin = activeTurn?.origin;
-    if (activeTurn) {
-      this.setSharedThreadId(activeTurn.threadId);
-    } else if (this.pendingThreadFollowId) {
-      this.setSharedThreadId(this.pendingThreadFollowId);
+    if (!activeTurn && this.pendingThreadFollowId) {
+      const pendingThreadId = this.pendingThreadFollowId;
       this.pendingThreadFollowId = null;
+      this.updateSharedThread(pendingThreadId, {
+        source: "local",
+        reason: "local_follow",
+        notify: true,
+      });
     }
   }
 
@@ -2985,8 +3016,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
       };
     }
 
-    if ((method === "turn/started" || method === "item/started") && !this.activeTurn) {
-      this.setSharedThreadId(threadId);
+    if (method === "turn/started" && !this.activeTurn) {
       return {
         threadId,
         turnId,
@@ -3157,7 +3187,11 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     }
 
     if (!this.activeTurn || this.activeTurn.threadId === threadId) {
-      this.setSharedThreadId(threadId);
+      this.updateSharedThread(threadId, {
+        source: "local",
+        reason: "local_follow",
+        notify: true,
+      });
       this.pendingThreadFollowId = null;
       return;
     }
@@ -3168,6 +3202,18 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
   private handleTrackedTurnStarted(trackedTurn: CodexActiveTurn): void {
     if (this.activeTurn?.turnId === trackedTurn.turnId) {
       return;
+    }
+
+    if (
+      trackedTurn.origin === "local" &&
+      trackedTurn.threadId !== this.sharedThreadId
+    ) {
+      this.updateSharedThread(trackedTurn.threadId, {
+        source: "local",
+        reason: "local_turn",
+        notify: true,
+      });
+      this.pendingThreadFollowId = null;
     }
 
     if (!this.activeTurn) {

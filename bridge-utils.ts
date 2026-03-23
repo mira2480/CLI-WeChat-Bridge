@@ -3,6 +3,8 @@ import type {
   BridgeAdapterState,
   BridgeResumeThreadCandidate,
   BridgeState,
+  BridgeThreadSwitchReason,
+  BridgeThreadSwitchSource,
   PendingApproval,
 } from "./bridge-types.ts";
 
@@ -262,6 +264,9 @@ export function formatStatusReport(
     `worker_status: ${adapterState.status}`,
     `worker_pid: ${adapterState.pid ?? "(unknown)"}`,
     `shared_thread_id: ${adapterState.sharedThreadId ?? "(none)"}`,
+    `last_thread_switch_at: ${adapterState.lastThreadSwitchAt ?? "(none)"}`,
+    `last_thread_switch_source: ${adapterState.lastThreadSwitchSource ?? "(none)"}`,
+    `last_thread_switch_reason: ${adapterState.lastThreadSwitchReason ?? "(none)"}`,
     `active_turn_id: ${adapterState.activeTurnId ?? "(none)"}`,
     `active_turn_origin: ${adapterState.activeTurnOrigin ?? "(none)"}`,
     `pending_approval_origin: ${adapterState.pendingApprovalOrigin ?? "(none)"}`,
@@ -270,6 +275,26 @@ export function formatStatusReport(
     `last_output_at: ${adapterState.lastOutputAt ?? "(none)"}`,
     `pending_confirmation: ${pending ? `${pending.source}:${pending.code}` : "(none)"}`,
   ].join("\n");
+}
+
+export function formatThreadSwitchMessage(params: {
+  threadId: string;
+  source: BridgeThreadSwitchSource;
+  reason: BridgeThreadSwitchReason;
+}): string {
+  const shortThreadId = params.threadId.slice(0, 12);
+
+  switch (params.reason) {
+    case "local_follow":
+    case "local_turn":
+      return `Codex thread switched to ${shortThreadId} from the local terminal.`;
+    case "wechat_resume":
+      return `Codex thread switched to ${shortThreadId} from WeChat.`;
+    case "startup_restore":
+      return `Codex restored shared thread ${shortThreadId} on startup.`;
+    default:
+      return `Codex thread switched to ${shortThreadId}.`;
+  }
 }
 
 export function formatResumeThreadList(

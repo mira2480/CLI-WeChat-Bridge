@@ -17,6 +17,7 @@ import {
   formatDuration,
   formatResumeThreadList,
   formatStatusReport,
+  formatThreadSwitchMessage,
   MESSAGE_START_GRACE_MS,
   nowIso,
   OutputBatcher,
@@ -375,6 +376,17 @@ function wireAdapterEvents(params: {
           await queueWechatMessage(
             authorizedUserId,
             `Local Codex input:\n${truncatePreview(event.text, 500)}`,
+          );
+        });
+        break;
+      case "thread_switched":
+        stateStore.appendLog(
+          `thread_switched: ${event.threadId} source=${event.source} reason=${event.reason}`,
+        );
+        void outputBatcher.flushNow().then(async () => {
+          await queueWechatMessage(
+            authorizedUserId,
+            formatThreadSwitchMessage(event),
           );
         });
         break;

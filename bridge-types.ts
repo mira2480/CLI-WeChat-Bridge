@@ -1,5 +1,11 @@
 export type BridgeAdapterKind = "codex" | "claude" | "shell";
 export type BridgeTurnOrigin = "wechat" | "local";
+export type BridgeThreadSwitchSource = BridgeTurnOrigin | "restore";
+export type BridgeThreadSwitchReason =
+  | "local_follow"
+  | "local_turn"
+  | "wechat_resume"
+  | "startup_restore";
 
 export type BridgeWorkerStatus =
   | "starting"
@@ -57,6 +63,9 @@ export type BridgeAdapterState = {
   lastOutputAt?: string;
   pendingApproval?: ApprovalRequest | null;
   sharedThreadId?: string;
+  lastThreadSwitchAt?: string;
+  lastThreadSwitchSource?: BridgeThreadSwitchSource;
+  lastThreadSwitchReason?: BridgeThreadSwitchReason;
   activeTurnId?: string;
   activeTurnOrigin?: BridgeTurnOrigin;
   pendingApprovalOrigin?: BridgeTurnOrigin;
@@ -89,6 +98,13 @@ export type BridgeEvent =
       text: string;
       timestamp: string;
       origin: "local";
+    }
+  | {
+      type: "thread_switched";
+      threadId: string;
+      source: BridgeThreadSwitchSource;
+      reason: BridgeThreadSwitchReason;
+      timestamp: string;
     }
   | {
       type: "task_complete";
