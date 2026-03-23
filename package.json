@@ -4,6 +4,13 @@
   "description": "WeChat MCP server via the official ilink API",
   "type": "module",
   "private": true,
+  "bin": {
+    "wechat-bridge": "./bin/wechat-bridge.mjs",
+    "wechat-bridge-codex": "./bin/wechat-bridge-codex.mjs",
+    "wechat-codex-panel": "./bin/wechat-codex-panel.mjs",
+    "wechat-bridge-claude": "./bin/wechat-bridge-claude.mjs",
+    "wechat-bridge-shell": "./bin/wechat-bridge-shell.mjs"
+  },
   "scripts": {
     "setup": "bun setup.ts",
     "start": "bun wechat-channel.ts",

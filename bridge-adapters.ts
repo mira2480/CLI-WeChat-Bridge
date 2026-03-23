@@ -1035,7 +1035,7 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
     this.shuttingDown = false;
     this.setStatus(
       "starting",
-      'Waiting for manual Codex panel connection. Run "bun run codex:panel" in a second terminal.',
+      'Waiting for manual Codex panel connection. Run "wechat-codex-panel" in a second terminal for this directory.',
     );
 
     await new Promise<void>((resolve, reject) => {
@@ -1115,7 +1115,7 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
   async dispose(): Promise<void> {
     this.shuttingDown = true;
     this.rejectPendingRequests("Codex panel proxy is shutting down.");
-    clearCodexPanelEndpoint(this.endpoint?.instanceId);
+    clearCodexPanelEndpoint(this.options.cwd, this.endpoint?.instanceId);
 
     if (this.socket) {
       try {
@@ -1187,7 +1187,7 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
         if (!this.shuttingDown) {
           this.setStatus(
             "starting",
-            'Codex panel disconnected. Run "bun run codex:panel" again in a second terminal.',
+            'Codex panel disconnected. Run "wechat-codex-panel" again in a second terminal for this directory.',
           );
         }
       }
@@ -1271,7 +1271,9 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
   private async sendRequest(payload: CodexPanelCommand): Promise<unknown> {
     const socket = this.socket;
     if (!socket) {
-      throw new Error('Codex panel is not connected. Run "bun run codex:panel" in a second terminal.');
+      throw new Error(
+        'Codex panel is not connected. Run "wechat-codex-panel" in a second terminal for this directory.',
+      );
     }
     if (!this.state.pid && payload.command !== "dispose") {
       throw new Error("Codex panel is connected but not ready yet. Wait for the panel to finish starting.");

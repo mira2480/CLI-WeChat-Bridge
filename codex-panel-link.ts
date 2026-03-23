@@ -2,7 +2,10 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import type net from "node:net";
 
-import { CODEX_PANEL_ENDPOINT_FILE, ensureChannelDataDir } from "./channel-config.ts";
+import {
+  ensureWorkspaceChannelDir,
+  getWorkspaceChannelPaths,
+} from "./channel-config.ts";
 import type { BridgeAdapterState, BridgeEvent } from "./bridge-types.ts";
 
 export type CodexPanelCommand =
@@ -60,41 +63,43 @@ export function buildCodexPanelToken(): string {
 }
 
 export function writeCodexPanelEndpoint(endpoint: CodexPanelEndpoint): void {
-  ensureChannelDataDir();
+  const { endpointFile } = ensureWorkspaceChannelDir(endpoint.cwd);
   fs.writeFileSync(
-    CODEX_PANEL_ENDPOINT_FILE,
+    endpointFile,
     JSON.stringify(endpoint, null, 2),
     "utf8",
   );
 }
 
-export function readCodexPanelEndpoint(): CodexPanelEndpoint | null {
+export function readCodexPanelEndpoint(cwd: string): CodexPanelEndpoint | null {
   try {
-    if (!fs.existsSync(CODEX_PANEL_ENDPOINT_FILE)) {
+    const { endpointFile } = getWorkspaceChannelPaths(cwd);
+    if (!fs.existsSync(endpointFile)) {
       return null;
     }
     return JSON.parse(
-      fs.readFileSync(CODEX_PANEL_ENDPOINT_FILE, "utf8"),
+      fs.readFileSync(endpointFile, "utf8"),
     ) as CodexPanelEndpoint;
   } catch {
     return null;
   }
 }
 
-export function clearCodexPanelEndpoint(instanceId?: string): void {
+export function clearCodexPanelEndpoint(cwd: string, instanceId?: string): void {
   try {
-    if (!fs.existsSync(CODEX_PANEL_ENDPOINT_FILE)) {
+    const { endpointFile } = getWorkspaceChannelPaths(cwd);
+    if (!fs.existsSync(endpointFile)) {
       return;
     }
 
     if (!instanceId) {
-      fs.rmSync(CODEX_PANEL_ENDPOINT_FILE, { force: true });
+      fs.rmSync(endpointFile, { force: true });
       return;
     }
 
-    const endpoint = readCodexPanelEndpoint();
+    const endpoint = readCodexPanelEndpoint(cwd);
     if (!endpoint || endpoint.instanceId === instanceId) {
-      fs.rmSync(CODEX_PANEL_ENDPOINT_FILE, { force: true });
+      fs.rmSync(endpointFile, { force: true });
     }
   } catch {
     // Best effort cleanup.

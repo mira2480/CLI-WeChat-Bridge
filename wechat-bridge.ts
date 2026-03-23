@@ -113,12 +113,13 @@ function parseCliArgs(argv: string[]): BridgeCliOptions {
 function printUsageAndExit(): never {
   process.stdout.write(
     [
-      "Usage: bun run bridge -- --adapter <codex|claude|shell> [--cmd <executable>] [--cwd <path>] [--profile <name-or-path>]",
+      "Usage: wechat-bridge --adapter <codex|claude|shell> [--cmd <executable>] [--cwd <path>] [--profile <name-or-path>]",
       "",
       "Examples:",
-      "  bun run bridge:codex",
-      "  bun run bridge:claude -- --cwd C:\\Users\\unlin\\Desktop\\Github",
-      "  bun run bridge:shell -- --cmd pwsh.exe",
+      "  wechat-bridge-codex",
+      "  wechat-bridge-claude --cwd C:\\Users\\unlin\\Desktop\\Github",
+      "  wechat-bridge-shell --cmd pwsh.exe",
+      "  bun run bridge:codex            # repo-local development entrypoint",
       "",
     ].join("\n"),
   );
@@ -227,7 +228,9 @@ async function main(): Promise<void> {
     }
     log(`Authorized WeChat user: ${credentials.userId}`);
     if (options.adapter === "codex") {
-      log('Start the visible Codex panel in a second terminal with: bun run codex:panel');
+      log(
+        'Start the visible Codex panel in a second terminal with: wechat-codex-panel',
+      );
     }
 
     while (true) {

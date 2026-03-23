@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -26,6 +27,13 @@ export const CODEX_PANEL_ENDPOINT_FILE = path.join(
   CHANNEL_DATA_DIR,
   "codex-panel-endpoint.json",
 );
+export const WORKSPACES_DIR = path.join(CHANNEL_DATA_DIR, "workspaces");
+
+export type WorkspaceChannelPaths = {
+  workspaceDir: string;
+  stateFile: string;
+  endpointFile: string;
+};
 
 const LEGACY_CHANNEL_DATA_DIR = path.join(
   MODULE_DIR,
@@ -39,6 +47,50 @@ const LEGACY_SYNC_BUF_FILE = path.join(LEGACY_CHANNEL_DATA_DIR, "sync_buf.txt");
 
 export function ensureChannelDataDir(): void {
   fs.mkdirSync(CHANNEL_DATA_DIR, { recursive: true });
+}
+
+export function normalizeWorkspacePath(cwd: string): string {
+  return path.resolve(cwd);
+}
+
+function buildComparableWorkspacePath(cwd: string): string {
+  const normalized = normalizeWorkspacePath(cwd);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function sanitizeWorkspaceSegment(value: string): string {
+  const sanitized = value
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40);
+  return sanitized || "workspace";
+}
+
+export function buildWorkspaceKey(cwd: string): string {
+  const normalized = normalizeWorkspacePath(cwd);
+  const digest = crypto
+    .createHash("sha256")
+    .update(buildComparableWorkspacePath(normalized))
+    .digest("hex")
+    .slice(0, 12);
+  const label = sanitizeWorkspaceSegment(path.basename(normalized));
+  return `${label}-${digest}`;
+}
+
+export function getWorkspaceChannelPaths(cwd: string): WorkspaceChannelPaths {
+  const workspaceDir = path.join(WORKSPACES_DIR, buildWorkspaceKey(cwd));
+  return {
+    workspaceDir,
+    stateFile: path.join(workspaceDir, "bridge-state.json"),
+    endpointFile: path.join(workspaceDir, "codex-panel-endpoint.json"),
+  };
+}
+
+export function ensureWorkspaceChannelDir(cwd: string): WorkspaceChannelPaths {
+  ensureChannelDataDir();
+  const paths = getWorkspaceChannelPaths(cwd);
+  fs.mkdirSync(paths.workspaceDir, { recursive: true });
+  return paths;
 }
 
 export function migrateLegacyChannelFiles(

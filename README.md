@@ -19,7 +19,7 @@ The bridge keeps one local session bridge alive and mirrors:
 
 Adapter behavior:
 
-- `codex` runs in two terminals: the bridge stays in one terminal, and the visible Codex panel runs in a second terminal via `bun run codex:panel`
+- `codex` runs in two terminals: the bridge stays in one terminal, and the visible Codex panel runs in a second terminal via `wechat-codex-panel`
 - `claude` and `powershell.exe` still use persistent interactive terminal sessions
 
 ## Requirements
@@ -37,7 +37,15 @@ Adapter behavior:
 bun install
 ```
 
-2. Log in to WeChat and save bridge credentials:
+2. Install the global PATH commands if you want to run the bridge from any directory:
+
+```bash
+npm install -g .
+# or, during local development
+npm link
+```
+
+3. Log in to WeChat and save bridge credentials:
 
 ```bash
 bun run setup
@@ -46,23 +54,23 @@ bun run setup
 Credentials are stored in `~/.claude/channels/wechat/account.json`.
 The bridge uses `account.json.userId` as the only authorized WeChat owner.
 
-3. Start a bridge:
+4. Start a bridge:
 
 ```bash
-bun run bridge:codex
+wechat-bridge-codex
 # or
-bun run bridge:claude
+wechat-bridge-claude
 # or
-bun run bridge:shell
+wechat-bridge-shell
 ```
 
-4. If you started `bridge:codex`, open a second terminal in the same repository and run:
+5. If you started `wechat-bridge-codex`, open a second terminal in the same working directory and run:
 
 ```bash
-bun run codex:panel
+wechat-codex-panel
 ```
 
-5. After startup:
+6. After startup:
 
 - Send plain text to forward input to the active CLI session
 - In `codex` mode, local `/resume` and WeChat `/resume` share the same saved Codex threads
@@ -101,10 +109,12 @@ log instead of raw TUI frames.
 
 ```bash
 bun run setup
-bun run bridge:codex
-bun run codex:panel
-bun run bridge:claude
-bun run bridge:shell
+wechat-bridge-codex
+wechat-codex-panel
+wechat-bridge-claude
+wechat-bridge-shell
+bun run bridge:codex                    # repo-local development entrypoint
+bun run codex:panel                     # repo-local development entrypoint
 bun run bridge:bun -- --adapter codex   # legacy Bun entrypoint for debugging
 bun run start                           # legacy MCP server
 bun run check                           # MCP status check
@@ -127,7 +137,7 @@ bun run test
 - The bridge is single-owner by design. The owner is `account.json.userId`.
 - `shell` mode keeps a persistent PowerShell session and adds approval for risky commands.
 - Approval detection for `codex` and `claude` is text-pattern based. Verify it once on your machine.
-- `codex` should be started as a two-terminal workflow: bridge first, then `bun run codex:panel` in a second terminal.
+- `codex` should be started as a two-terminal workflow: bridge first, then `wechat-codex-panel` in a second terminal in the same working directory.
 - `codex` persists its normal session history under `~/.codex/sessions`, and the bridge restores the last shared thread on restart when possible.
 - WeChat intentionally does not receive raw Codex TUI frames, task summaries, or heartbeat spam.
 - The current WeChat ClawBot path still depends on the official iOS client feature set.

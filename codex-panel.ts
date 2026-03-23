@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import net from "node:net";
+import path from "node:path";
 
 import { createBridgeAdapter } from "./bridge-adapters.ts";
 import {
@@ -15,31 +16,53 @@ function log(message: string): void {
   process.stderr.write(`[codex-panel] ${message}\n`);
 }
 
-function parseCliArgs(argv: string[]): void {
-  for (const arg of argv) {
+type CodexPanelCliOptions = {
+  cwd: string;
+};
+
+function parseCliArgs(argv: string[]): CodexPanelCliOptions {
+  let cwd = process.cwd();
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    const next = argv[i + 1];
+
     if (arg === "--help" || arg === "-h") {
       process.stdout.write(
         [
-          "Usage: bun run codex:panel",
+          "Usage: codex-panel [--cwd <path>]",
           "",
-          'Starts the visible Codex panel and connects it to the running "bun run bridge:codex" instance.',
+          'Starts the visible Codex panel and connects it to the running "wechat-bridge-codex" instance for the current directory.',
           "",
         ].join("\n"),
       );
       process.exit(0);
     }
 
+    if (arg === "--cwd") {
+      if (!next) {
+        throw new Error("--cwd requires a value");
+      }
+      cwd = path.resolve(next);
+      i += 1;
+      continue;
+    }
+
     throw new Error(`Unknown argument: ${arg}`);
   }
+
+  return { cwd };
 }
 
 async function main(): Promise<void> {
   migrateLegacyChannelFiles(log);
-  parseCliArgs(process.argv.slice(2));
+  const options = parseCliArgs(process.argv.slice(2));
 
-  const endpoint = readCodexPanelEndpoint();
+  const endpoint = readCodexPanelEndpoint(options.cwd);
   if (!endpoint) {
-    throw new Error('No active Codex bridge endpoint was found. Start "bun run bridge:codex" first.');
+    throw new Error(
+      `No active Codex bridge endpoint was found for ${options.cwd}. Start "wechat-bridge-codex" in that directory first.`,
+    );
   }
 
   const socket = await new Promise<net.Socket>((resolve, reject) => {

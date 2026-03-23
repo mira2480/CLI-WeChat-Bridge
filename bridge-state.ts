@@ -4,6 +4,7 @@ import {
   BRIDGE_LOCK_FILE,
   BRIDGE_LOG_FILE,
   BRIDGE_STATE_FILE,
+  ensureWorkspaceChannelDir,
   ensureChannelDataDir,
 } from "./channel-config.ts";
 import type {
@@ -65,9 +66,11 @@ export class BridgeStateStore {
   private readonly lockPayload: BridgeLockPayload;
   private readonly bridgeStartedAtMs: number;
   private readonly instanceId: string;
+  private readonly stateFilePath: string;
 
   constructor(options: BridgeStateOptions) {
     ensureChannelDataDir();
+    this.stateFilePath = ensureWorkspaceChannelDir(options.cwd).stateFile;
     this.bridgeStartedAtMs = Date.now();
     this.instanceId = buildInstanceId();
     this.lockPayload = {
@@ -171,7 +174,7 @@ export class BridgeStateStore {
 
   private save(): void {
     ensureChannelDataDir();
-    fs.writeFileSync(BRIDGE_STATE_FILE, JSON.stringify(this.state, null, 2), "utf-8");
+    fs.writeFileSync(this.stateFilePath, JSON.stringify(this.state, null, 2), "utf-8");
   }
 
   private acquireLock(): void {
@@ -198,9 +201,16 @@ export class BridgeStateStore {
 
   private readStateFile(): Partial<BridgeState> | null {
     try {
+      if (fs.existsSync(this.stateFilePath)) {
+        return JSON.parse(
+          fs.readFileSync(this.stateFilePath, "utf-8"),
+        ) as Partial<BridgeState>;
+      }
+
       if (!fs.existsSync(BRIDGE_STATE_FILE)) {
         return null;
       }
+
       return JSON.parse(
         fs.readFileSync(BRIDGE_STATE_FILE, "utf-8"),
       ) as Partial<BridgeState>;
