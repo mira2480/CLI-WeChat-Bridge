@@ -161,6 +161,15 @@ const HIGH_RISK_PATTERNS = [
   /\b(?:invoke-expression|iex)\b/i,
   /\bcurl\b.*\|\s*(?:iex|powershell)\b/i,
   /\binvoke-webrequest\b.*\|\s*(?:iex|powershell)\b/i,
+  /\brm\b\s+-[A-Za-z-]*r[A-Za-z-]*/i,
+  /\bsudo\b/i,
+  /\bmkfs(?:\.\w+)?\b/i,
+  /\bdd\b/i,
+  /\breboot\b/i,
+  /\bsystemctl\b/i,
+  /\blaunchctl\b/i,
+  /\bcurl\b.*\|\s*(?:sh|bash|zsh)\b/i,
+  /\bwget\b.*\|\s*(?:sh|bash|zsh)\b/i,
 ];
 
 export function isHighRiskShellCommand(command: string): boolean {

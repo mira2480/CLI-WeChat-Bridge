@@ -15,14 +15,14 @@ describe("workspace channel paths", () => {
   });
 
   test("builds a stable workspace key for the same cwd", () => {
-    const cwd = path.join("C:\\", "Users", "unlin", "Desktop", "Github", "repo");
+    const cwd = path.resolve("test-workspaces", "repo");
 
     expect(buildWorkspaceKey(cwd)).toBe(buildWorkspaceKey(cwd));
   });
 
   test("builds different workspace paths for different cwd values", () => {
-    const repoA = path.join("C:\\", "Users", "unlin", "Desktop", "Github", "repo-a");
-    const repoB = path.join("C:\\", "Users", "unlin", "Desktop", "Github", "repo-b");
+    const repoA = path.resolve("test-workspaces", "repo-a");
+    const repoB = path.resolve("test-workspaces", "repo-b");
 
     const pathsA = getWorkspaceChannelPaths(repoA);
     const pathsB = getWorkspaceChannelPaths(repoB);

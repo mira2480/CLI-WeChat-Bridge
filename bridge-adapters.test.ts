@@ -5,8 +5,12 @@ import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 
 import {
+  buildCliEnvironment,
   buildCodexCliArgs,
   buildCodexApprovalRequest,
+  buildPtySpawnOptions,
+  buildShellInputPayload,
+  buildShellProfileCommand,
   createBridgeAdapter,
   extractCodexFinalTextFromItem,
   extractCodexThreadFollowIdFromStatusChanged,
@@ -15,6 +19,8 @@ import {
   findRecentCodexSessionFileForCwd,
   listCodexResumeThreads,
   matchesCodexSessionMeta,
+  resolveDefaultAdapterCommand,
+  resolveShellRuntime,
   resolveSpawnTarget,
   shouldAutoCompleteCodexWechatTurnAfterFinalReply,
   shouldIgnoreCodexSessionReplayEntry,
@@ -235,20 +241,152 @@ describe("resolveSpawnTarget", () => {
   });
 });
 
+describe("resolveDefaultAdapterCommand", () => {
+  test("keeps codex and claude defaults unchanged", () => {
+    expect(resolveDefaultAdapterCommand("codex", { platform: "linux" })).toBe("codex");
+    expect(resolveDefaultAdapterCommand("claude", { platform: "darwin" })).toBe("claude");
+  });
+
+  test("keeps the Windows shell default unchanged", () => {
+    expect(resolveDefaultAdapterCommand("shell", { platform: "win32" })).toBe("powershell.exe");
+  });
+
+  test("selects the first available non-Windows shell in priority order", () => {
+    const tempDir = makeTempDirectory();
+    const binDirectory = path.join(tempDir, "bin");
+    const zshPath = path.join(binDirectory, "zsh");
+    writeFile(zshPath);
+
+    expect(
+      resolveDefaultAdapterCommand("shell", {
+        platform: "linux",
+        env: { PATH: binDirectory },
+      }),
+    ).toBe("zsh");
+  });
+
+  test("throws a helpful error when no non-Windows shell is available", () => {
+    expect(() =>
+      resolveDefaultAdapterCommand("shell", {
+        platform: "linux",
+        env: { PATH: "" },
+      }),
+    ).toThrow("Tried: pwsh, bash, zsh, sh");
+  });
+});
+
+describe("buildCliEnvironment", () => {
+  test("keeps the curated Windows CLI environment for codex and claude", () => {
+    const env = buildCliEnvironment("codex", {
+      platform: "win32",
+      env: {
+        PATH: "C:\\tools",
+        USERPROFILE: "C:\\Users\\tester",
+        FOO: "bar",
+      },
+    });
+
+    expect(env.PATH).toBe("C:\\tools");
+    expect(env.HOME).toBe("C:\\Users\\tester");
+    expect(env.FOO).toBeUndefined();
+  });
+
+  test("passes through the non-Windows CLI environment", () => {
+    const env = buildCliEnvironment("claude", {
+      platform: "linux",
+      env: {
+        PATH: "/usr/bin",
+        HOME: "/home/tester",
+        FOO: "bar",
+      },
+    });
+
+    expect(env.PATH).toBe("/usr/bin");
+    expect(env.HOME).toBe("/home/tester");
+    expect(env.FOO).toBe("bar");
+  });
+});
+
+describe("buildPtySpawnOptions", () => {
+  test("enables ConPTY only on Windows", () => {
+    expect(
+      buildPtySpawnOptions({
+        cwd: "C:\\repo",
+        env: { TERM: "xterm-256color" },
+        platform: "win32",
+      }).useConpty,
+    ).toBe(true);
+
+    expect(
+      buildPtySpawnOptions({
+        cwd: "/repo",
+        env: { TERM: "xterm-256color" },
+        platform: "linux",
+      }).useConpty,
+    ).toBeUndefined();
+  });
+});
+
+describe("resolveShellRuntime", () => {
+  test("builds non-Windows PowerShell launch args", () => {
+    expect(resolveShellRuntime("pwsh", { platform: "linux" })).toEqual({
+      family: "powershell",
+      launchArgs: ["-NoLogo", "-Command", "-"],
+    });
+  });
+
+  test("builds POSIX shell launch args", () => {
+    expect(resolveShellRuntime("/bin/bash", { platform: "darwin" })).toEqual({
+      family: "posix",
+      launchArgs: ["-i"],
+    });
+  });
+
+  test("rejects unsupported shell executables", () => {
+    expect(() => resolveShellRuntime("fish", { platform: "linux" })).toThrow(
+      "Unsupported shell executable",
+    );
+  });
+});
+
+describe("shell helpers", () => {
+  test("builds a PowerShell profile source command", () => {
+    expect(buildShellProfileCommand("C:\\profiles\\wechat.ps1", "powershell")).toContain(
+      'C:\\profiles\\wechat.ps1',
+    );
+  });
+
+  test("quotes POSIX shell profile paths safely", () => {
+    const command = buildShellProfileCommand("/tmp/it's-profile.sh", "posix");
+    expect(command.startsWith(". '")).toBe(true);
+    expect(command).toContain(`it'"'"'s-profile.sh'`);
+  });
+
+  test("builds shell input payloads with a completion sentinel", () => {
+    expect(buildShellInputPayload("Get-ChildItem", "powershell")).toContain(
+      "__WECHAT_BRIDGE_DONE__",
+    );
+    expect(buildShellInputPayload("ls", "posix")).toContain(
+      "printf '__WECHAT_BRIDGE_DONE__:%s\\n'",
+    );
+  });
+});
+
 describe("matchesCodexSessionMeta", () => {
   test("matches the expected cwd and thread id", () => {
     const startedAtMs = Date.parse("2026-03-22T15:00:00.000Z");
+    const cwd = "C:\\workspace\\wechat-bridge";
 
     expect(
       matchesCodexSessionMeta(
         {
           id: "thread_123",
-          cwd: "C:\\Users\\unlin\\Desktop\\Github\\claude-code-wechat-channel",
+          cwd,
           source: "cli",
           timestamp: "2026-03-22T15:00:02.000Z",
         },
         {
-          cwd: "C:\\Users\\unlin\\Desktop\\Github\\claude-code-wechat-channel",
+          cwd,
           startedAtMs,
           threadId: "thread_123",
         },
@@ -258,17 +396,18 @@ describe("matchesCodexSessionMeta", () => {
 
   test("rejects a session from the same cwd when the source does not match", () => {
     const startedAtMs = Date.parse("2026-03-22T15:00:00.000Z");
+    const cwd = "C:\\workspace\\wechat-bridge";
 
     expect(
       matchesCodexSessionMeta(
         {
           id: "thread_123",
-          cwd: "C:\\Users\\unlin\\Desktop\\Github\\claude-code-wechat-channel",
+          cwd,
           source: { custom: "cli" },
           timestamp: "2026-03-22T15:00:02.000Z",
         },
         {
-          cwd: "C:\\Users\\unlin\\Desktop\\Github\\claude-code-wechat-channel",
+          cwd,
           startedAtMs,
           sessionSource: "wechat_bridge",
         },
@@ -278,17 +417,18 @@ describe("matchesCodexSessionMeta", () => {
 
   test("rejects a session that started too far before the bridge session", () => {
     const startedAtMs = Date.parse("2026-03-22T15:00:00.000Z");
+    const cwd = "C:\\workspace\\wechat-bridge";
 
     expect(
       matchesCodexSessionMeta(
         {
           id: "thread_999",
-          cwd: "C:\\Users\\unlin\\Desktop\\Github\\claude-code-wechat-channel",
+          cwd,
           source: "wechat_bridge",
           timestamp: "2026-03-22T14:55:00.000Z",
         },
         {
-          cwd: "C:\\Users\\unlin\\Desktop\\Github\\claude-code-wechat-channel",
+          cwd,
           startedAtMs,
           sessionSource: "wechat_bridge",
         },

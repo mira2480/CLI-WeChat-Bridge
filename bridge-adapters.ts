@@ -124,6 +124,15 @@ const CODEX_APP_SERVER_LOG_LIMIT = 12_000;
 const CODEX_RPC_CONNECT_RETRY_MS = 150;
 const CODEX_RPC_RECONNECT_TIMEOUT_MS = 5_000;
 const CODEX_SESSION_LOCAL_MIRROR_FALLBACK_WINDOW_MS = 15_000;
+const DEFAULT_UNIX_SHELL_CANDIDATES = ["pwsh", "bash", "zsh", "sh"] as const;
+const POSIX_SHELL_NAMES = new Set(["bash", "zsh", "sh", "dash", "ksh"]);
+
+export type ShellRuntimeFamily = "powershell" | "posix";
+
+export type ShellRuntime = {
+  family: ShellRuntimeFamily;
+  launchArgs: string[];
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -634,10 +643,66 @@ function resolveBundledWindowsExe(
   return undefined;
 }
 
-function buildCliEnvironment(kind: BridgeAdapterKind): Record<string, string> {
+function copyDefinedEnv(
+  env: Record<string, string | undefined>,
+): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value === "string") {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
+export function resolveDefaultAdapterCommand(
+  kind: BridgeAdapterKind,
+  options: {
+    env?: Record<string, string | undefined>;
+    platform?: NodeJS.Platform;
+  } = {},
+): string {
+  const platform = options.platform ?? process.platform;
+  if (kind !== "shell") {
+    return kind;
+  }
+
+  if (platform === "win32") {
+    return "powershell.exe";
+  }
+
+  const env = options.env ?? (process.env as Record<string, string | undefined>);
+  for (const candidate of DEFAULT_UNIX_SHELL_CANDIDATES) {
+    if (resolveCommandPath(candidate, platform, env)) {
+      return candidate;
+    }
+  }
+
+  throw new Error(
+    `No default shell executable was found on ${platform}. Tried: ${DEFAULT_UNIX_SHELL_CANDIDATES.join(", ")}. Use --cmd <executable>.`,
+  );
+}
+
+export function buildCliEnvironment(
+  kind: BridgeAdapterKind,
+  options: {
+    env?: Record<string, string | undefined>;
+    platform?: NodeJS.Platform;
+  } = {},
+): Record<string, string> {
+  const sourceEnv = options.env ?? (process.env as Record<string, string | undefined>);
+  const platform = options.platform ?? process.platform;
+
   if (kind === "codex" || kind === "claude") {
+    if (platform !== "win32") {
+      return {
+        ...copyDefinedEnv(sourceEnv),
+        TERM: sourceEnv.TERM || "xterm-256color",
+      };
+    }
+
     const env: Record<string, string> = {
-      TERM: process.env.TERM || "xterm-256color",
+      TERM: sourceEnv.TERM || "xterm-256color",
     };
 
     const keys = [
@@ -661,7 +726,7 @@ function buildCliEnvironment(kind: BridgeAdapterKind): Record<string, string> {
     ] as const;
 
     for (const key of keys) {
-      const value = process.env[key];
+      const value = sourceEnv[key];
       if (value) {
         env[key] = value;
       }
@@ -675,9 +740,116 @@ function buildCliEnvironment(kind: BridgeAdapterKind): Record<string, string> {
   }
 
   return {
-    ...process.env,
-    TERM: process.env.TERM || "xterm-256color",
-  } as Record<string, string>;
+    ...copyDefinedEnv(sourceEnv),
+    TERM: sourceEnv.TERM || "xterm-256color",
+  };
+}
+
+export function buildPtySpawnOptions(params: {
+  cwd: string;
+  env: Record<string, string>;
+  platform?: NodeJS.Platform;
+}): Parameters<typeof spawnPty>[2] {
+  const options: Parameters<typeof spawnPty>[2] = {
+    name: "xterm-color",
+    cols: DEFAULT_COLS,
+    rows: DEFAULT_ROWS,
+    cwd: params.cwd,
+    env: params.env,
+  };
+
+  if ((params.platform ?? process.platform) === "win32") {
+    options.useConpty = true;
+  }
+
+  return options;
+}
+
+function normalizeShellCommandName(command: string): string {
+  return path.parse(path.basename(command)).name.toLowerCase();
+}
+
+export function resolveShellRuntime(
+  command: string,
+  options: {
+    platform?: NodeJS.Platform;
+  } = {},
+): ShellRuntime {
+  const platform = options.platform ?? process.platform;
+  const name = normalizeShellCommandName(command);
+
+  if (name === "powershell" || name === "pwsh") {
+    return {
+      family: "powershell",
+      launchArgs:
+        platform === "win32"
+          ? ["-NoLogo", "-ExecutionPolicy", "Bypass", "-Command", "-"]
+          : ["-NoLogo", "-Command", "-"],
+    };
+  }
+
+  if (POSIX_SHELL_NAMES.has(name)) {
+    return {
+      family: "posix",
+      launchArgs: ["-i"],
+    };
+  }
+
+  throw new Error(
+    `Unsupported shell executable for shell adapter: ${command}. Supported shells: powershell, pwsh, bash, zsh, sh, dash, ksh.`,
+  );
+}
+
+function escapePowerShellString(text: string): string {
+  return text.replace(/`/g, "``").replace(/"/g, '`"');
+}
+
+function escapePosixShellString(text: string): string {
+  return `'${text.replace(/'/g, `'\"'\"'`)}'`;
+}
+
+export function buildShellProfileCommand(
+  profilePath: string,
+  family: ShellRuntimeFamily,
+): string {
+  const resolved = path.resolve(profilePath);
+  if (family === "powershell") {
+    return `. "${escapePowerShellString(resolved)}"`;
+  }
+  return `. ${escapePosixShellString(resolved)}`;
+}
+
+export function buildShellInputPayload(
+  text: string,
+  family: ShellRuntimeFamily,
+): string {
+  if (family === "powershell") {
+    const script = [
+      "$__wechatBridgePreviousErrorActionPreference = $ErrorActionPreference",
+      "$ErrorActionPreference = 'Continue'",
+      "$global:LASTEXITCODE = 0",
+      "try {",
+      text,
+      "} catch {",
+      "  Write-Error $_",
+      "  $global:LASTEXITCODE = 1",
+      "} finally {",
+      "  if (-not ($global:LASTEXITCODE -is [int])) { $global:LASTEXITCODE = 0 }",
+      '  Write-Output "__WECHAT_BRIDGE_DONE__:$global:LASTEXITCODE"',
+      "  $ErrorActionPreference = $__wechatBridgePreviousErrorActionPreference",
+      "}",
+      "",
+    ];
+    return `${script.join("\r")}\r`;
+  }
+
+  const script = [
+    text,
+    "__wechat_bridge_status=$?",
+    `printf '__WECHAT_BRIDGE_DONE__:%s\\n' "$__wechat_bridge_status"`,
+    "",
+  ];
+  return `${script.join("\r")}\r`;
 }
 
 async function reserveLocalPort(): Promise<number> {
@@ -1514,17 +1686,14 @@ abstract class AbstractPtyAdapter implements BridgeAdapter {
     let spawnTarget: SpawnTarget | null = null;
     try {
       spawnTarget = resolveSpawnTarget(this.options.command, this.options.kind);
+      const env = this.buildEnv();
       const ptyProcess = spawnPty(
         spawnTarget.file,
         [...spawnTarget.args, ...this.buildSpawnArgs()],
-        {
-          name: "xterm-color",
-          cols: DEFAULT_COLS,
-          rows: DEFAULT_ROWS,
+        buildPtySpawnOptions({
           cwd: this.options.cwd,
-          env: this.buildEnv(),
-          useConpty: true,
-        },
+          env,
+        }),
       );
 
       this.pty = ptyProcess;
@@ -4067,15 +4236,24 @@ class ShellAdapter extends AbstractPtyAdapter {
   private interruptTimer: ReturnType<typeof setTimeout> | null = null;
 
   protected buildSpawnArgs(): string[] {
-    return ["-NoLogo", "-ExecutionPolicy", "Bypass", "-Command", "-"];
+    return this.getShellRuntime().launchArgs;
+  }
+
+  protected override buildEnv(): Record<string, string> {
+    const env = super.buildEnv();
+    if (this.getShellRuntime().family === "posix") {
+      env.PS1 = "";
+      env.PROMPT = "";
+      env.RPROMPT = "";
+    }
+    return env;
   }
 
   protected afterStart(): void {
     if (this.options.profile) {
-      const profilePath = this.escapePowerShellString(
-        path.resolve(this.options.profile),
+      this.writeToPty(
+        `${buildShellProfileCommand(this.options.profile, this.getShellRuntime().family)}\r`,
       );
-      this.writeToPty(`. "${profilePath}"\r`);
     }
   }
 
@@ -4125,23 +4303,7 @@ class ShellAdapter extends AbstractPtyAdapter {
   }
 
   protected override prepareInput(text: string): string {
-    const script = [
-      "$__wechatBridgePreviousErrorActionPreference = $ErrorActionPreference",
-      "$ErrorActionPreference = 'Continue'",
-      "$global:LASTEXITCODE = 0",
-      "try {",
-      text,
-      "} catch {",
-      "  Write-Error $_",
-      "  $global:LASTEXITCODE = 1",
-      "} finally {",
-      "  if (-not ($global:LASTEXITCODE -is [int])) { $global:LASTEXITCODE = 0 }",
-      '  Write-Output "__WECHAT_BRIDGE_DONE__:$global:LASTEXITCODE"',
-      "  $ErrorActionPreference = $__wechatBridgePreviousErrorActionPreference",
-      "}",
-      "",
-    ];
-    return `${script.join("\r")}\r`;
+    return buildShellInputPayload(text, this.getShellRuntime().family);
   }
 
   protected override defaultCompletionDelayMs(): number {
@@ -4218,6 +4380,7 @@ class ShellAdapter extends AbstractPtyAdapter {
   }
 
   private filterShellOutput(text: string): string {
+    const family = this.getShellRuntime().family;
     return text
       .split("\n")
       .filter((line) => {
@@ -4234,13 +4397,21 @@ class ShellAdapter extends AbstractPtyAdapter {
         if (trimmed === "try {" || trimmed === "} catch {" || trimmed === "}") {
           return false;
         }
+        if (family === "posix") {
+          if (trimmed === "__wechat_bridge_status=$?") {
+            return false;
+          }
+          if (trimmed.startsWith("printf '__WECHAT_BRIDGE_DONE__:%s")) {
+            return false;
+          }
+        }
         return true;
       })
       .join("\n");
   }
 
-  private escapePowerShellString(text: string): string {
-    return text.replace(/`/g, "``").replace(/"/g, '`"');
+  private getShellRuntime(): ShellRuntime {
+    return resolveShellRuntime(this.options.command);
   }
 }
 

@@ -48,6 +48,8 @@ describe("isHighRiskShellCommand", () => {
     expect(isHighRiskShellCommand("Remove-Item -Recurse C:\\temp")).toBe(true);
     expect(isHighRiskShellCommand("git reset --hard HEAD~1")).toBe(true);
     expect(isHighRiskShellCommand("shutdown /s /t 0")).toBe(true);
+    expect(isHighRiskShellCommand("rm -rf /tmp/demo")).toBe(true);
+    expect(isHighRiskShellCommand("curl https://example.com/install.sh | sh")).toBe(true);
   });
 
   test("allows low-risk commands", () => {

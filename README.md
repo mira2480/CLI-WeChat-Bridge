@@ -1,5 +1,10 @@
 # CLI WeChat Bridge
 
+> Platform support:
+> - Windows: primary validated native platform.
+> - Linux/macOS: native support is available for `codex`, `claude`, and `shell`.
+> - Non-Windows `shell` defaults to `pwsh`, then `bash`, `zsh`, and `sh`.
+
 将微信接入本地 AI 编码工作流的桥接工具。
 
 本项目用于桥接微信消息与本地运行的 `codex`、`claude` 或持久化 `powershell.exe` 会话，并将本地输出、审批请求与运行状态同步回微信。当前实现以 `codex` 工作流为中心展开，重点是保留本地原生终端体验，并在此基础上提供微信侧的远程输入、结果回流与状态同步能力。
@@ -38,8 +43,8 @@
 ### 1. 克隆仓库并安装依赖
 
 ```bash
-git clone <your-repo-url>
-cd claude-code-wechat-channel
+git clone https://github.com/UNLINEARITY/CLI-WeChat-Bridge
+cd CLI-WeChat-Bridge
 bun install
 ```
 

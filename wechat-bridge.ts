@@ -2,7 +2,10 @@
 
 import path from "node:path";
 
-import { createBridgeAdapter } from "./bridge-adapters.ts";
+import {
+  createBridgeAdapter,
+  resolveDefaultAdapterCommand,
+} from "./bridge-adapters.ts";
 import { migrateLegacyChannelFiles } from "./channel-config.ts";
 import { BridgeStateStore } from "./bridge-state.ts";
 import type {
@@ -100,7 +103,7 @@ function parseCliArgs(argv: string[]): BridgeCliOptions {
     throw new Error("Missing required --adapter <codex|claude|shell>");
   }
 
-  const defaultCommand = adapter === "shell" ? "powershell.exe" : adapter;
+  const defaultCommand = resolveDefaultAdapterCommand(adapter);
   return {
     adapter,
     command: commandOverride ?? defaultCommand,
@@ -116,8 +119,9 @@ function printUsageAndExit(): never {
       "",
       "Examples:",
       "  wechat-bridge-codex",
-      "  wechat-bridge-claude --cwd C:\\Users\\unlin\\Desktop\\Github",
-      "  wechat-bridge-shell --cmd pwsh.exe",
+      "  wechat-bridge-claude --cwd ~/work/my-project",
+      "  wechat-bridge-shell --cmd pwsh",
+      "  wechat-bridge-shell --cmd bash",
       "  bun run bridge:codex            # repo-local development entrypoint",
       "",
     ].join("\n"),
