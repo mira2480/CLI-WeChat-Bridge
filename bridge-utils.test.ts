@@ -1,0 +1,132 @@
+import { describe, expect, test } from "bun:test";
+
+import {
+  buildOneTimeCode,
+  detectCliApproval,
+  isHighRiskShellCommand,
+  MESSAGE_START_GRACE_MS,
+  OutputBatcher,
+  parseCodexSessionAgentMessage,
+  parseSystemCommand,
+  shouldDropStartupBacklogMessage,
+} from "./bridge-utils.ts";
+
+describe("parseSystemCommand", () => {
+  test("parses supported control commands", () => {
+    expect(parseSystemCommand("/status")).toEqual({ type: "status" });
+    expect(parseSystemCommand("/reset")).toEqual({ type: "reset" });
+    expect(parseSystemCommand("/stop")).toEqual({ type: "stop" });
+    expect(parseSystemCommand("/confirm 123456")).toEqual({
+      type: "confirm",
+      code: "123456",
+    });
+    expect(parseSystemCommand("/deny")).toEqual({ type: "deny" });
+  });
+
+  test("returns null for unsupported input", () => {
+    expect(parseSystemCommand("hello")).toBeNull();
+    expect(parseSystemCommand("/unknown foo")).toBeNull();
+  });
+});
+
+describe("buildOneTimeCode", () => {
+  test("creates uppercase confirmation codes", () => {
+    const code = buildOneTimeCode(8);
+    expect(code).toHaveLength(8);
+    expect(code).toMatch(/^[A-Z2-9]+$/);
+  });
+});
+
+describe("isHighRiskShellCommand", () => {
+  test("flags destructive commands", () => {
+    expect(isHighRiskShellCommand("Remove-Item -Recurse C:\\temp")).toBe(true);
+    expect(isHighRiskShellCommand("git reset --hard HEAD~1")).toBe(true);
+    expect(isHighRiskShellCommand("shutdown /s /t 0")).toBe(true);
+  });
+
+  test("allows low-risk commands", () => {
+    expect(isHighRiskShellCommand("Get-ChildItem")).toBe(false);
+    expect(isHighRiskShellCommand("git status")).toBe(false);
+  });
+});
+
+describe("detectCliApproval", () => {
+  test("recognizes common yes/no prompts", () => {
+    const approval = detectCliApproval("Do you want to allow this action? (y/n)");
+    expect(approval?.source).toBe("cli");
+    expect(approval?.confirmInput).toBe("y\r");
+    expect(approval?.denyInput).toBe("n\r");
+  });
+
+  test("returns null for ordinary output", () => {
+    expect(detectCliApproval("Task completed successfully.")).toBeNull();
+  });
+});
+
+describe("parseCodexSessionAgentMessage", () => {
+  test("extracts final-answer agent messages from the Codex session log", () => {
+    expect(
+      parseCodexSessionAgentMessage(
+        JSON.stringify({
+          timestamp: "2026-03-22T14:50:22.195Z",
+          type: "event_msg",
+          payload: {
+            type: "agent_message",
+            phase: "final_answer",
+            message: "Hello from Codex.",
+          },
+        }),
+      ),
+    ).toEqual({
+      timestamp: "2026-03-22T14:50:22.195Z",
+      phase: "final_answer",
+      message: "Hello from Codex.",
+    });
+  });
+
+  test("ignores unrelated JSONL entries", () => {
+    expect(
+      parseCodexSessionAgentMessage(
+        JSON.stringify({
+          timestamp: "2026-03-22T14:50:22.195Z",
+          type: "response_item",
+          payload: { type: "message" },
+        }),
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("OutputBatcher", () => {
+  test("flushes by size and keeps a recent summary", async () => {
+    const flushed: string[] = [];
+    const batcher = new OutputBatcher(
+      async (text) => {
+        flushed.push(text);
+      },
+      10_000,
+      5,
+    );
+
+    batcher.push("hello world");
+    await batcher.flushNow();
+
+    expect(flushed.length).toBeGreaterThanOrEqual(2);
+    expect(flushed.join("")).toContain("hello");
+    expect(batcher.getRecentSummary()).toContain("hello");
+  });
+});
+
+describe("startup backlog filtering", () => {
+  test("drops messages older than bridge startup watermark", () => {
+    const startedAt = Date.now();
+    expect(
+      shouldDropStartupBacklogMessage(
+        startedAt - MESSAGE_START_GRACE_MS - 1,
+        startedAt,
+      ),
+    ).toBe(true);
+    expect(shouldDropStartupBacklogMessage(startedAt, startedAt)).toBe(false);
+    expect(shouldDropStartupBacklogMessage(undefined, startedAt)).toBe(true);
+  });
+});

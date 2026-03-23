@@ -1,0 +1,95 @@
+export type BridgeAdapterKind = "codex" | "claude" | "shell";
+
+export type BridgeWorkerStatus =
+  | "starting"
+  | "idle"
+  | "busy"
+  | "awaiting_approval"
+  | "stopped"
+  | "error";
+
+export type ApprovalSource = "shell" | "cli";
+
+export type ApprovalRequest = {
+  source: ApprovalSource;
+  summary: string;
+  commandPreview: string;
+  confirmInput?: string;
+  denyInput?: string;
+};
+
+export type PendingApproval = ApprovalRequest & {
+  code: string;
+  createdAt: string;
+};
+
+export type BridgeState = {
+  instanceId: string;
+  adapter: BridgeAdapterKind;
+  command: string;
+  cwd: string;
+  profile?: string;
+  bridgeStartedAtMs: number;
+  authorizedUserId: string;
+  ignoredBacklogCount: number;
+  pendingConfirmation?: PendingApproval | null;
+  lastActivityAt?: string;
+};
+
+export type BridgeAdapterState = {
+  kind: BridgeAdapterKind;
+  status: BridgeWorkerStatus;
+  pid?: number;
+  cwd: string;
+  command: string;
+  profile?: string;
+  startedAt?: string;
+  lastInputAt?: string;
+  lastOutputAt?: string;
+  pendingApproval?: ApprovalRequest | null;
+};
+
+export type BridgeEvent =
+  | {
+      type: "stdout";
+      text: string;
+      timestamp: string;
+    }
+  | {
+      type: "stderr";
+      text: string;
+      timestamp: string;
+    }
+  | {
+      type: "status";
+      status: BridgeWorkerStatus;
+      message?: string;
+      timestamp: string;
+    }
+  | {
+      type: "approval_required";
+      request: ApprovalRequest;
+      timestamp: string;
+    }
+  | {
+      type: "task_complete";
+      exitCode?: number;
+      summary?: string;
+      timestamp: string;
+    }
+  | {
+      type: "fatal_error";
+      message: string;
+      timestamp: string;
+    };
+
+export interface BridgeAdapter {
+  setEventSink(sink: (event: BridgeEvent) => void): void;
+  start(): Promise<void>;
+  sendInput(text: string): Promise<void>;
+  interrupt(): Promise<boolean>;
+  reset(): Promise<void>;
+  resolveApproval(action: "confirm" | "deny"): Promise<boolean>;
+  dispose(): Promise<void>;
+  getState(): BridgeAdapterState;
+}

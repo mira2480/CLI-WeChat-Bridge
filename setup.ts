@@ -187,8 +187,16 @@ async function main() {
         console.log(`User ID: ${account.userId ?? "(unknown)"}`);
         console.log(`Credentials saved to: ${CREDENTIALS_FILE}`);
         console.log();
-        console.log("Start Claude Code with:");
-        console.log("  claude --dangerously-load-development-channels server:wechat");
+        console.log("No /pair step is required.");
+        console.log("The logged-in WeChat account above becomes the only authorized bridge owner.");
+        console.log();
+        console.log("Start the WeChat bridge with:");
+        console.log("  bun run bridge:codex");
+        console.log("  bun run bridge:claude");
+        console.log("  bun run bridge:shell");
+        console.log();
+        console.log("Legacy MCP server entrypoint:");
+        console.log("  bun run start");
         return;
       }
     }

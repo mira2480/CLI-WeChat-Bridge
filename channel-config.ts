@@ -19,6 +19,9 @@ export const CONTEXT_CACHE_FILE = path.join(
   CHANNEL_DATA_DIR,
   "context_tokens.json",
 );
+export const BRIDGE_STATE_FILE = path.join(CHANNEL_DATA_DIR, "bridge-state.json");
+export const BRIDGE_LOG_FILE = path.join(CHANNEL_DATA_DIR, "bridge.log");
+export const BRIDGE_LOCK_FILE = path.join(CHANNEL_DATA_DIR, "bridge.lock.json");
 
 const LEGACY_CHANNEL_DATA_DIR = path.join(
   MODULE_DIR,

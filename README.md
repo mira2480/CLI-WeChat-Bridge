@@ -1,74 +1,124 @@
-# Claude Code WeChat Channel
+# Claude Code / Codex WeChat Bridge
 
-将微信消息桥接到 Claude Code 会话的 Channel 插件。
+Bridge WeChat messages into a local interactive `codex`, `claude`, or persistent
+`powershell.exe` session. The main workflow is:
 
-基于微信官方 ClawBot ilink API（与 `@tencent-weixin/openclaw-weixin` 使用相同协议），让你在微信中直接与 Claude Code 对话。
-
-## 工作原理
-
+```text
+WeChat (iOS) -> WeChat ClawBot -> ilink API -> wechat-bridge
+                                              |
+                                              +--> codex
+                                              +--> claude
+                                              +--> powershell.exe
 ```
-微信 (iOS) → WeChat ClawBot → ilink API → [本插件] → Claude Code Session
-                                                  ↕
-Claude Code ← MCP Channel Protocol ← wechat_reply tool
-```
 
-## 前置要求
+The bridge keeps one local session bridge alive and mirrors:
 
-- [Bun](https://bun.sh) >= 1.0
-- [Claude Code](https://claude.com/claude-code) >= 2.1.80
-- claude.ai 账号登录（不支持 API key）
-- 微信 iOS 最新版（需支持 ClawBot 插件）
+- WeChat messages -> local CLI stdin
+- Local CLI output -> WeChat replies
+- Approval prompts -> WeChat `/confirm` or `/deny`
 
-## 快速开始
+Adapter behavior:
 
-### 1. 安装依赖
+- `codex` keeps a visible interactive panel in the current terminal and sends only final assistant replies back to WeChat
+- `claude` and `powershell.exe` still use persistent interactive terminal sessions
+
+## Requirements
+
+- Bun >= 1.0 for setup and tests
+- Node.js >= 24 for the default bridge runtime
+- A local CLI to bridge: `codex`, `claude`, or `powershell.exe`
+- The latest iOS WeChat build with ClawBot support
+
+## Quick Start
+
+1. Install dependencies:
 
 ```bash
-git clone https://github.com/anthropics/claude-code-wechat-channel.git
-cd claude-code-wechat-channel
 bun install
 ```
 
-### 2. 微信扫码登录
+2. Log in to WeChat and save bridge credentials:
 
 ```bash
-bun setup.ts
+bun run setup
 ```
 
-终端会显示二维码，用微信扫描并确认。凭据保存到 `~/.claude/channels/wechat/account.json`。
+Credentials are stored in `~/.claude/channels/wechat/account.json`.
+The bridge uses `account.json.userId` as the only authorized WeChat owner.
 
-### 3. 启动 Claude Code + WeChat 通道
+3. Start a bridge:
 
 ```bash
-cd claude-code-wechat-channel
-claude --dangerously-load-development-channels server:wechat
+bun run bridge:codex
+# or
+bun run bridge:claude
+# or
+bun run bridge:shell
 ```
 
-### 4. 在微信中发消息
+4. After startup:
 
-打开微信，找到 ClawBot 对话，发送消息。消息会出现在 Claude Code 终端中，Claude 的回复会自动发回微信。
+- Send plain text to forward input to the active CLI session
+- Use `/status` to inspect the bridge
+- Use `/stop` to send Ctrl+C
+- Use `/reset` to restart the local session
+- Use `/confirm <code>` or `/deny` for approval prompts
+- No `/pair` step is required
+- Only the logged-in WeChat account from `account.json.userId` is allowed to use the bridge
 
-## 文件说明
+## Why Node Is The Default Bridge Runtime
 
-| 文件 | 说明 |
-|------|------|
-| `wechat-channel.ts` | MCP Channel 服务器主文件 |
-| `setup.ts` | 独立的微信扫码登录工具 |
-| `.mcp.json` | Claude Code MCP 服务器配置 |
+On Windows, interactive `node-pty` sessions are more reliable under Node.js than
+under Bun for `codex` and `claude`. The package scripts keep the same
+`bun run bridge:*` user interface, but those scripts now launch Node directly:
 
-## 技术细节
+```bash
+node --no-warnings --experimental-strip-types wechat-bridge.ts --adapter codex
+```
 
-- **消息接收**: 通过 `ilink/bot/getupdates` 长轮询获取微信消息
-- **消息发送**: 通过 `ilink/bot/sendmessage` 发送回复
-- **认证**: 使用 `ilink/bot/get_bot_qrcode` QR 码登录获取 Bearer Token
-- **协议**: 基于 MCP (Model Context Protocol) 的 Channel 扩展
+The bridge also resolves Windows launchers more carefully:
 
-## 注意事项
+- `codex.ps1` is avoided because PowerShell execution policy often blocks it
+- `codex.cmd` is wrapped through `cmd.exe` when needed
+- bundled vendor `codex.exe` is preferred when available
+- `claude.exe` is launched directly when present
 
-- 当前为 research preview 阶段，需要使用 `--dangerously-load-development-channels` 标志
-- Claude Code 会话关闭后通道也会断开
-- 微信 ClawBot 目前仅支持 iOS 最新版
-- 每个 ClawBot 只能连接一个 agent 实例
+For `codex`, the bridge also starts a private local app-server and connects the
+visible TUI client to it. This keeps the terminal panel interactive while the
+bridge extracts clean final replies for WeChat from the Codex session log.
+
+## Scripts
+
+```bash
+bun run setup
+bun run bridge:codex
+bun run bridge:claude
+bun run bridge:shell
+bun run bridge:bun -- --adapter codex   # legacy Bun entrypoint for debugging
+bun run start                           # legacy MCP server
+bun run check                           # MCP status check
+bun run test
+```
+
+## Files
+
+| File | Purpose |
+| --- | --- |
+| `wechat-bridge.ts` | Main WeChat <-> CLI bridge loop |
+| `bridge-adapters.ts` | `codex` / `claude` / `shell` PTY adapters |
+| `bridge-state.ts` | Owner lock, state file, and logs |
+| `wechat-transport.ts` | ilink polling and send-message transport |
+| `wechat-channel.ts` | Legacy MCP server |
+| `setup.ts` | QR login flow and credential bootstrap |
+
+## Notes
+
+- The bridge is single-owner by design. The owner is `account.json.userId`.
+- `shell` mode keeps a persistent PowerShell session and adds approval for risky commands.
+- Approval detection for `codex` and `claude` is text-pattern based. Verify it once on your machine.
+- `codex` shows its panel in the same terminal that launched `bun run bridge:codex`.
+- WeChat intentionally does not receive raw Codex TUI frames, task summaries, or heartbeat spam.
+- The current WeChat ClawBot path still depends on the official iOS client feature set.
 
 ## License
 
