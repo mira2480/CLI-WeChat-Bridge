@@ -1,12 +1,14 @@
 export type BridgeAdapterKind = "codex" | "claude" | "shell";
 export type BridgeTurnOrigin = "wechat" | "local";
-export type BridgeThreadSwitchSource = BridgeTurnOrigin | "restore";
-export type BridgeThreadSwitchReason =
+export type BridgeSessionSwitchSource = BridgeTurnOrigin | "restore";
+export type BridgeSessionSwitchReason =
   | "local_follow"
   | "local_session_fallback"
   | "local_turn"
   | "wechat_resume"
   | "startup_restore";
+export type BridgeThreadSwitchSource = BridgeSessionSwitchSource;
+export type BridgeThreadSwitchReason = BridgeSessionSwitchReason;
 
 export type BridgeWorkerStatus =
   | "starting"
@@ -22,6 +24,7 @@ export type ApprovalRequest = {
   source: ApprovalSource;
   summary: string;
   commandPreview: string;
+  requestId?: string;
   confirmInput?: string;
   denyInput?: string;
 };
@@ -31,12 +34,15 @@ export type PendingApproval = ApprovalRequest & {
   createdAt: string;
 };
 
-export type BridgeResumeThreadCandidate = {
-  threadId: string;
+export type BridgeResumeSessionCandidate = {
+  sessionId: string;
   title: string;
   lastUpdatedAt: string;
   source?: string;
+  threadId?: string;
 };
+
+export type BridgeResumeThreadCandidate = BridgeResumeSessionCandidate;
 
 export type BridgeState = {
   instanceId: string;
@@ -47,7 +53,10 @@ export type BridgeState = {
   bridgeStartedAtMs: number;
   authorizedUserId: string;
   ignoredBacklogCount: number;
+  sharedSessionId?: string;
   sharedThreadId?: string;
+  resumeConversationId?: string;
+  transcriptPath?: string;
   pendingConfirmation?: PendingApproval | null;
   lastActivityAt?: string;
 };
@@ -63,7 +72,14 @@ export type BridgeAdapterState = {
   lastInputAt?: string;
   lastOutputAt?: string;
   pendingApproval?: ApprovalRequest | null;
+  sharedSessionId?: string;
   sharedThreadId?: string;
+  activeRuntimeSessionId?: string;
+  resumeConversationId?: string;
+  transcriptPath?: string;
+  lastSessionSwitchAt?: string;
+  lastSessionSwitchSource?: BridgeSessionSwitchSource;
+  lastSessionSwitchReason?: BridgeSessionSwitchReason;
   lastThreadSwitchAt?: string;
   lastThreadSwitchSource?: BridgeThreadSwitchSource;
   lastThreadSwitchReason?: BridgeThreadSwitchReason;
@@ -80,6 +96,11 @@ export type BridgeEvent =
     }
   | {
       type: "stderr";
+      text: string;
+      timestamp: string;
+    }
+  | {
+      type: "final_reply";
       text: string;
       timestamp: string;
     }
@@ -101,6 +122,13 @@ export type BridgeEvent =
       origin: "local";
     }
   | {
+      type: "session_switched";
+      sessionId: string;
+      source: BridgeSessionSwitchSource;
+      reason: BridgeSessionSwitchReason;
+      timestamp: string;
+    }
+  | {
       type: "thread_switched";
       threadId: string;
       source: BridgeThreadSwitchSource;
@@ -114,6 +142,11 @@ export type BridgeEvent =
       timestamp: string;
     }
   | {
+      type: "task_failed";
+      message: string;
+      timestamp: string;
+    }
+  | {
       type: "fatal_error";
       message: string;
       timestamp: string;
@@ -123,8 +156,8 @@ export interface BridgeAdapter {
   setEventSink(sink: (event: BridgeEvent) => void): void;
   start(): Promise<void>;
   sendInput(text: string): Promise<void>;
-  listResumeThreads(limit?: number): Promise<BridgeResumeThreadCandidate[]>;
-  resumeThread(threadId: string): Promise<void>;
+  listResumeSessions(limit?: number): Promise<BridgeResumeSessionCandidate[]>;
+  resumeSession(sessionId: string): Promise<void>;
   interrupt(): Promise<boolean>;
   reset(): Promise<void>;
   resolveApproval(action: "confirm" | "deny"): Promise<boolean>;

@@ -7,7 +7,7 @@
 
 > 当前支持状态说明  
 > - `codex`：当前优先支持的适配器，功能链路最完整，完成度最高（也许是目前最接近原生体验的项目）
-> - `claude code`：已接入基础桥接，但受当前 channels 链路与交互模型限制，尚未完善（目前还是channels功能较为完善，但是由于权限灰度测试，此仓库暂时没有完善）
+> - `claude code`：已接入双终端 companion 桥接；当前以 hooks + interactive PTY 为主线，仍在持续补齐审批与会话一致性体验
 > - `shell`：可用，适合持久化 PowerShell 会话桥接
 
 ## 这个项目解决什么问题
@@ -148,7 +148,7 @@ wechat-bridge-shell
 | 适配器 | 当前状态 | 说明 |
 | --- | --- | --- |
 | `codex` | 当前优先支持，完成度最高 | 双终端模式；本地 panel 为线程权威；微信跟随本地线程；本地与远程衔接能力最完整 |
-| `claude` | 已接入，尚未完善 | 当前仍以持久 PTY 会话桥接为主；尚未达到与 `codex` 同等级的会话一致性 |
+| `claude` | 已接入，持续完善中 | 当前采用 `wechat-bridge-claude` + `wechat-claude` 的双终端 companion 模式；会话切换、最终回复与审批元数据已按 Claude session 语义同步，但整体成熟度仍低于 `codex` |
 | `shell` | 可用 | 持久 `powershell.exe` 会话；高风险命令支持审批 |
 
 ### 关于 `codex`
@@ -187,6 +187,7 @@ wechat-bridge-shell
 wechat-bridge-codex
 wechat-codex
 wechat-bridge-claude
+wechat-claude
 wechat-bridge-shell
 ```
 
@@ -197,6 +198,7 @@ bun run setup
 bun run bridge:codex
 bun run codex:panel
 bun run bridge:claude
+bun run claude:companion
 bun run bridge:shell
 bun run bridge:bun -- --adapter codex
 bun run test
@@ -272,7 +274,7 @@ wechat-codex --cwd D:\work\my-project
 微信侧会接收到：
 
 - 普通输出文本
-- 本地输入摘要 `Local Codex input`
+- 本地输入摘要，按 adapter 显示为 `Local Codex input` 或 `Local Claude input`
 - 最终回复
 - 审批请求
 - 线程切换提示
@@ -438,7 +440,7 @@ npm install -g .
 
 - 当前主要在 Windows 环境下验证
 - `codex` 是当前优先支持的路径
-- `claude code` 目前受 channels 链路与交互模型限制，尚未达到 `codex` 的完成度
+- `claude code` 当前已切到 companion + hooks 路径，但整体成熟度仍未达到 `codex`
 - `codex` 模式下微信 `/resume` 被禁用
 - 当前模型是单 owner、单 bridge、单活动工作区
 - 当前仍依赖 iLink / ClawBot 这一链路

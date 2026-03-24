@@ -4,8 +4,12 @@ import type { BridgeAdapterState, BridgeState } from "./bridge-types.ts";
 import {
   buildOneTimeCode,
   detectCliApproval,
+  formatFinalReplyMessage,
+  formatMirroredUserInputMessage,
+  formatResumeSessionList,
   formatResumeThreadList,
   formatStatusReport,
+  formatTaskFailedMessage,
   formatThreadSwitchMessage,
   isHighRiskShellCommand,
   MESSAGE_START_GRACE_MS,
@@ -149,6 +153,7 @@ describe("formatStatusReport", () => {
       bridgeStartedAtMs: 1_700_000_000_000,
       authorizedUserId: "wx-owner",
       ignoredBacklogCount: 0,
+      sharedSessionId: "thread_persisted",
       sharedThreadId: "thread_persisted",
       pendingConfirmation: null,
       lastActivityAt: "2026-03-23T12:00:00.000Z",
@@ -158,7 +163,11 @@ describe("formatStatusReport", () => {
       status: "busy",
       cwd: "C:\\repo",
       command: "codex",
+      sharedSessionId: "thread_123",
       sharedThreadId: "thread_123",
+      lastSessionSwitchAt: "2026-03-23T12:05:00.000Z",
+      lastSessionSwitchSource: "local",
+      lastSessionSwitchReason: "local_follow",
       lastThreadSwitchAt: "2026-03-23T12:05:00.000Z",
       lastThreadSwitchSource: "local",
       lastThreadSwitchReason: "local_follow",
@@ -168,16 +177,16 @@ describe("formatStatusReport", () => {
     };
 
     expect(formatStatusReport(bridgeState, adapterState)).toContain(
-      "shared_thread_id: thread_123",
+      "shared_session_id: thread_123",
     );
     expect(formatStatusReport(bridgeState, adapterState)).toContain(
-      "last_thread_switch_source: local",
+      "last_session_switch_source: local",
     );
     expect(formatStatusReport(bridgeState, adapterState)).toContain(
-      "last_thread_switch_reason: local_follow",
+      "last_session_switch_reason: local_follow",
     );
     expect(formatStatusReport(bridgeState, adapterState)).toContain(
-      "persisted_shared_thread_id: thread_persisted",
+      "persisted_shared_session_id: thread_persisted",
     );
     expect(formatStatusReport(bridgeState, adapterState)).toContain(
       "active_turn_origin: local",
@@ -241,5 +250,39 @@ describe("formatResumeThreadList", () => {
     expect(output).toContain("1. Fix the bridge resume flow");
     expect(output).toContain("[current]");
     expect(output).toContain("/resume <number>");
+  });
+});
+
+describe("formatResumeSessionList", () => {
+  test("renders Claude sessions with session wording", () => {
+    const output = formatResumeSessionList({
+      adapter: "claude",
+      candidates: [
+        {
+          sessionId: "session_1",
+          title: "Continue the Claude bridge refactor",
+          lastUpdatedAt: "2026-03-24T08:00:00.000Z",
+        },
+      ],
+      currentSessionId: "session_1",
+    });
+
+    expect(output).toContain("Recent sessions:");
+    expect(output).toContain("session_1");
+    expect(output).toContain("[current]");
+    expect(output).toContain("/resume <sessionId>");
+  });
+});
+
+describe("adapter-aware message formatting", () => {
+  test("formats mirrored Claude input without Codex wording", () => {
+    expect(formatMirroredUserInputMessage("claude", "Review the hooks flow")).toContain(
+      "Local Claude input",
+    );
+  });
+
+  test("formats final reply and failure messages by adapter", () => {
+    expect(formatFinalReplyMessage("claude", "Done")).toBe("Claude final reply:\nDone");
+    expect(formatTaskFailedMessage("claude", "Boom")).toBe("Claude task failed:\nBoom");
   });
 });

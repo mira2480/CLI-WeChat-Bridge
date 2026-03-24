@@ -6,6 +6,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 
 import {
   buildCliEnvironment,
+  buildClaudeCliArgs,
   buildCodexCliArgs,
   buildCodexApprovalRequest,
   buildPtySpawnOptions,
@@ -17,6 +18,8 @@ import {
   extractCodexThreadStartedThreadId,
   extractCodexUserMessageText,
   findRecentCodexSessionFileForCwd,
+  hasClaudeNoAltScreenOption,
+  isClaudeInvalidResumeError,
   listCodexResumeThreads,
   matchesCodexSessionMeta,
   resolveDefaultAdapterCommand,
@@ -524,6 +527,71 @@ describe("buildCodexCliArgs", () => {
   });
 });
 
+describe("Claude CLI compatibility", () => {
+  test("detects whether the installed help text exposes --no-alt-screen", () => {
+    expect(
+      hasClaudeNoAltScreenOption(`Options:\n  --settings <file>\n  --no-alt-screen\n`),
+    ).toBe(true);
+    expect(
+      hasClaudeNoAltScreenOption(`Options:\n  --settings <file>\n  --resume [value]\n`),
+    ).toBe(false);
+  });
+
+  test("builds Claude companion args without unsupported alt-screen flags", () => {
+    expect(
+      buildClaudeCliArgs({
+        settingsFilePath: "/tmp/claude-settings.json",
+        resumeConversationId: "session_123",
+        profile: "wechat",
+      }),
+    ).toEqual([
+      "--settings",
+      "/tmp/claude-settings.json",
+      "--resume",
+      "session_123",
+      "--profile",
+      "wechat",
+    ]);
+  });
+
+  test("keeps --no-alt-screen only when a compatible Claude build exposes it", () => {
+    expect(
+      buildClaudeCliArgs({
+        settingsFilePath: "/tmp/claude-settings.json",
+        includeNoAltScreen: true,
+      }),
+    ).toEqual(["--no-alt-screen", "--settings", "/tmp/claude-settings.json"]);
+  });
+
+  test("recognizes Claude invalid resume errors", () => {
+    expect(
+      isClaudeInvalidResumeError(
+        "No conversation found with session ID: 019d1b3c-bf74-7e31-b105-2f28e27fa969",
+      ),
+    ).toBe(true);
+    expect(isClaudeInvalidResumeError("Claude is ready.")).toBe(false);
+  });
+
+  test("keeps Claude runtime session and resume conversation ids separate", () => {
+    const adapter = createBridgeAdapter({
+      kind: "claude",
+      command: "claude",
+      cwd: process.cwd(),
+      renderMode: "companion",
+      initialSharedSessionId: "runtime-session-123",
+      initialResumeConversationId: "resume-conversation-456",
+      initialTranscriptPath: "/tmp/resume-conversation-456.jsonl",
+    });
+
+    expect(adapter.getState()).toMatchObject({
+      sharedSessionId: "runtime-session-123",
+      activeRuntimeSessionId: "runtime-session-123",
+      resumeConversationId: "resume-conversation-456",
+      transcriptPath: "/tmp/resume-conversation-456.jsonl",
+    });
+  });
+});
+
 describe("extractCodexThreadFollowIdFromStatusChanged", () => {
   test("accepts idle thread status notifications from the local panel", () => {
     expect(
@@ -988,8 +1056,10 @@ describe("listCodexResumeThreads", () => {
 
       const candidates = listCodexResumeThreads(repoCwd, 10);
       expect(candidates).toHaveLength(2);
+      expect(candidates[0]?.sessionId).toBe("thread_b");
       expect(candidates[0]?.threadId).toBe("thread_b");
       expect(candidates[0]?.title).toContain("Resume the latest saved thread");
+      expect(candidates[1]?.sessionId).toBe("thread_a");
       expect(candidates[1]?.threadId).toBe("thread_a");
     } finally {
       if (previousHome === undefined) {

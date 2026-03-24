@@ -17,8 +17,11 @@ import {
   buildOneTimeCode,
   formatApprovalMessage,
   formatDuration,
+  formatFinalReplyMessage,
+  formatMirroredUserInputMessage,
+  formatSessionSwitchMessage,
   formatStatusReport,
-  formatThreadSwitchMessage,
+  formatTaskFailedMessage,
   MESSAGE_START_GRACE_MS,
   nowIso,
   OutputBatcher,
@@ -153,7 +156,10 @@ async function main(): Promise<void> {
     command: options.command,
     cwd: options.cwd,
     profile: options.profile,
-    initialSharedThreadId: stateStore.getState().sharedThreadId,
+    initialSharedSessionId:
+      stateStore.getState().sharedSessionId ?? stateStore.getState().sharedThreadId,
+    initialResumeConversationId: stateStore.getState().resumeConversationId,
+    initialTranscriptPath: stateStore.getState().transcriptPath,
   });
   let sendChain = Promise.resolve();
   let activeTask: ActiveTask | null = null;
@@ -212,13 +218,13 @@ async function main(): Promise<void> {
       updateLastOutputAt: () => {
         lastOutputAt = Date.now();
       },
-      syncSharedThreadState: () => {
-        syncSharedThreadState(stateStore, adapter);
+      syncSharedSessionState: () => {
+        syncSharedSessionState(stateStore, adapter);
       },
     });
 
     await adapter.start();
-    syncSharedThreadState(stateStore, adapter);
+    syncSharedSessionState(stateStore, adapter);
     stateStore.appendLog(
       `Bridge started with adapter=${options.adapter} command=${options.command} cwd=${options.cwd}`,
     );
@@ -232,6 +238,10 @@ async function main(): Promise<void> {
     if (options.adapter === "codex") {
       log(
         'Start the visible Codex panel in a second terminal with: wechat-codex',
+      );
+    } else if (options.adapter === "claude") {
+      log(
+        'Start the visible Claude companion in a second terminal with: wechat-claude',
       );
     }
 
@@ -270,7 +280,7 @@ async function main(): Promise<void> {
           activeTask = nextTask;
           lastHeartbeatAt = 0;
         }
-        syncSharedThreadState(stateStore, adapter);
+        syncSharedSessionState(stateStore, adapter);
       }
 
       const adapterState = adapter.getState();
@@ -294,20 +304,37 @@ async function main(): Promise<void> {
   }
 }
 
-function syncSharedThreadState(
+function syncSharedSessionState(
   stateStore: BridgeStateStore,
   adapter: BridgeAdapter,
 ): void {
-  const persistedThreadId = stateStore.getState().sharedThreadId;
-  const adapterThreadId = adapter.getState().sharedThreadId;
+  const persistedState = stateStore.getState();
+  const persistedSessionId = persistedState.sharedSessionId ?? persistedState.sharedThreadId;
+  const adapterState = adapter.getState();
+  const adapterSessionId = adapterState.sharedSessionId ?? adapterState.sharedThreadId;
 
-  if (adapterThreadId && adapterThreadId !== persistedThreadId) {
-    stateStore.setSharedThreadId(adapterThreadId);
+  if (adapterSessionId && adapterSessionId !== persistedSessionId) {
+    stateStore.setSharedSessionId(adapterSessionId);
+  } else if (!adapterSessionId && persistedSessionId) {
+    stateStore.clearSharedSessionId();
+  }
+
+  if (persistedState.adapter !== "claude") {
     return;
   }
 
-  if (!adapterThreadId && persistedThreadId) {
-    stateStore.clearSharedThreadId();
+  if (
+    adapterState.resumeConversationId !== persistedState.resumeConversationId ||
+    adapterState.transcriptPath !== persistedState.transcriptPath
+  ) {
+    if (adapterState.resumeConversationId || adapterState.transcriptPath) {
+      stateStore.setClaudeResumeState(
+        adapterState.resumeConversationId,
+        adapterState.transcriptPath,
+      );
+    } else {
+      stateStore.clearClaudeResumeState();
+    }
   }
 }
 
@@ -320,7 +347,7 @@ function wireAdapterEvents(params: {
   getActiveTask: () => ActiveTask | null;
   clearActiveTask: () => void;
   updateLastOutputAt: () => void;
-  syncSharedThreadState: () => void;
+  syncSharedSessionState: () => void;
 }): void {
   const {
     adapter,
@@ -331,11 +358,11 @@ function wireAdapterEvents(params: {
     getActiveTask,
     clearActiveTask,
     updateLastOutputAt,
-    syncSharedThreadState,
+    syncSharedSessionState,
   } = params;
 
   adapter.setEventSink((event) => {
-    syncSharedThreadState();
+    syncSharedSessionState();
     const authorizedUserId = stateStore.getState().authorizedUserId;
 
     switch (event.type) {
@@ -343,6 +370,14 @@ function wireAdapterEvents(params: {
       case "stderr":
         updateLastOutputAt();
         outputBatcher.push(event.text);
+        break;
+      case "final_reply":
+        void outputBatcher.flushNow().then(async () => {
+          await queueWechatMessage(
+            authorizedUserId,
+            formatFinalReplyMessage(options.adapter, event.text),
+          );
+        });
         break;
       case "status":
         if (event.message) {
@@ -372,7 +407,23 @@ function wireAdapterEvents(params: {
           stateStore.appendLog(`mirrored_local_input: ${truncatePreview(event.text)}`);
           await queueWechatMessage(
             authorizedUserId,
-            `Local Codex input:\n${truncatePreview(event.text, 500)}`,
+            formatMirroredUserInputMessage(options.adapter, event.text),
+          );
+        });
+        break;
+      case "session_switched":
+        stateStore.appendLog(
+          `session_switched: ${event.sessionId} source=${event.source} reason=${event.reason}`,
+        );
+        void outputBatcher.flushNow().then(async () => {
+          await queueWechatMessage(
+            authorizedUserId,
+            formatSessionSwitchMessage({
+              adapter: options.adapter,
+              sessionId: event.sessionId,
+              source: event.source,
+              reason: event.reason,
+            }),
           );
         });
         break;
@@ -383,14 +434,19 @@ function wireAdapterEvents(params: {
         void outputBatcher.flushNow().then(async () => {
           await queueWechatMessage(
             authorizedUserId,
-            formatThreadSwitchMessage(event),
+            formatSessionSwitchMessage({
+              adapter: options.adapter,
+              sessionId: event.threadId,
+              source: event.source,
+              reason: event.reason,
+            }),
           );
         });
         break;
       case "task_complete":
         void outputBatcher.flushNow().then(async () => {
           stateStore.clearPendingConfirmation();
-          if (options.adapter !== "codex") {
+          if (options.adapter === "shell") {
             const summary = buildCompletionSummary({
               adapter: options.adapter,
               activeTask: getActiveTask(),
@@ -400,6 +456,16 @@ function wireAdapterEvents(params: {
             await queueWechatMessage(authorizedUserId, summary);
           }
           clearActiveTask();
+        });
+        break;
+      case "task_failed":
+        void outputBatcher.flushNow().then(async () => {
+          stateStore.clearPendingConfirmation();
+          clearActiveTask();
+          await queueWechatMessage(
+            authorizedUserId,
+            formatTaskFailedMessage(options.adapter, event.message),
+          );
         });
         break;
       case "fatal_error":
@@ -468,10 +534,17 @@ async function handleInboundMessage(params: {
         );
         return null;
       }
+      if (options.adapter === "claude") {
+        await queueWechatMessage(
+          message.senderId,
+          'WeChat /resume is disabled in claude mode. Use /resume directly inside "wechat-claude"; WeChat will follow the active local session.',
+        );
+        return null;
+      }
 
       await queueWechatMessage(
         message.senderId,
-        "/resume is only supported when the bridge is running in codex mode.",
+        `/resume is not available in ${options.adapter} mode.`,
       );
       return null;
     }
@@ -489,7 +562,7 @@ async function handleInboundMessage(params: {
       await outputBatcher.flushNow();
       outputBatcher.clear();
       stateStore.clearPendingConfirmation();
-      stateStore.clearSharedThreadId();
+      stateStore.clearSharedSessionId();
       await adapter.reset();
       stateStore.appendLog("Worker reset by owner.");
       await queueWechatMessage(message.senderId, "Worker session has been reset.");

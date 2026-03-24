@@ -85,11 +85,21 @@ export class BridgeStateStore {
     this.acquireLock();
 
     const persisted = this.readStateFile();
-    const persistedSharedThreadId =
-      options.adapter === "codex" &&
-      persisted?.adapter === "codex" &&
-      persisted.cwd === options.cwd
-        ? persisted.sharedThreadId
+    const persistedSharedSessionId =
+      persisted?.cwd === options.cwd
+        ? persisted.sharedSessionId ?? persisted.sharedThreadId
+        : undefined;
+    const persistedResumeConversationId =
+      options.adapter === "claude" &&
+      persisted?.cwd === options.cwd &&
+      typeof persisted.resumeConversationId === "string"
+        ? persisted.resumeConversationId
+        : undefined;
+    const persistedTranscriptPath =
+      options.adapter === "claude" &&
+      persisted?.cwd === options.cwd &&
+      typeof persisted.transcriptPath === "string"
+        ? persisted.transcriptPath
         : undefined;
     this.state = {
       instanceId: this.instanceId,
@@ -100,7 +110,11 @@ export class BridgeStateStore {
       authorizedUserId: options.authorizedUserId,
       bridgeStartedAtMs: this.bridgeStartedAtMs,
       ignoredBacklogCount: 0,
-      sharedThreadId: persistedSharedThreadId,
+      sharedSessionId: persistedSharedSessionId,
+      sharedThreadId:
+        options.adapter === "codex" ? persistedSharedSessionId : undefined,
+      resumeConversationId: persistedResumeConversationId,
+      transcriptPath: persistedTranscriptPath,
       lastActivityAt: persisted?.lastActivityAt,
       pendingConfirmation: null,
     };
@@ -139,16 +153,49 @@ export class BridgeStateStore {
     this.save();
   }
 
+  setSharedSessionId(sessionId: string): void {
+    this.state.sharedSessionId = sessionId;
+    this.state.sharedThreadId = this.state.adapter === "codex" ? sessionId : undefined;
+    this.save();
+  }
+
   setSharedThreadId(threadId: string): void {
-    this.state.sharedThreadId = threadId;
+    this.setSharedSessionId(threadId);
+  }
+
+  clearSharedSessionId(): void {
+    if (!this.state.sharedSessionId && !this.state.sharedThreadId) {
+      return;
+    }
+    this.state.sharedSessionId = undefined;
+    this.state.sharedThreadId = undefined;
     this.save();
   }
 
   clearSharedThreadId(): void {
-    if (!this.state.sharedThreadId) {
+    this.clearSharedSessionId();
+  }
+
+  setClaudeResumeState(resumeConversationId?: string, transcriptPath?: string): void {
+    if (this.state.adapter !== "claude") {
       return;
     }
-    this.state.sharedThreadId = undefined;
+
+    this.state.resumeConversationId = resumeConversationId || undefined;
+    this.state.transcriptPath = transcriptPath || undefined;
+    this.save();
+  }
+
+  clearClaudeResumeState(): void {
+    if (
+      this.state.adapter !== "claude" ||
+      (!this.state.resumeConversationId && !this.state.transcriptPath)
+    ) {
+      return;
+    }
+
+    this.state.resumeConversationId = undefined;
+    this.state.transcriptPath = undefined;
     this.save();
   }
 

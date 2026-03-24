@@ -1,7 +1,11 @@
 import type {
   ApprovalRequest,
+  BridgeAdapterKind,
   BridgeAdapterState,
+  BridgeResumeSessionCandidate,
   BridgeResumeThreadCandidate,
+  BridgeSessionSwitchReason,
+  BridgeSessionSwitchSource,
   BridgeState,
   BridgeThreadSwitchReason,
   BridgeThreadSwitchSource,
@@ -255,6 +259,16 @@ export function formatStatusReport(
   adapterState: BridgeAdapterState,
 ): string {
   const pending = bridgeState.pendingConfirmation;
+  const persistedSharedSessionId =
+    bridgeState.sharedSessionId ?? bridgeState.sharedThreadId;
+  const sharedSessionId =
+    adapterState.sharedSessionId ?? adapterState.sharedThreadId;
+  const lastSessionSwitchAt =
+    adapterState.lastSessionSwitchAt ?? adapterState.lastThreadSwitchAt;
+  const lastSessionSwitchSource =
+    adapterState.lastSessionSwitchSource ?? adapterState.lastThreadSwitchSource;
+  const lastSessionSwitchReason =
+    adapterState.lastSessionSwitchReason ?? adapterState.lastThreadSwitchReason;
   const formatEpochMs = (value?: number) =>
     typeof value === "number" && Number.isFinite(value)
       ? new Date(value).toISOString()
@@ -269,13 +283,13 @@ export function formatStatusReport(
     `bridge_started_at: ${formatEpochMs(bridgeState.bridgeStartedAtMs)}`,
     `authorized_user: ${bridgeState.authorizedUserId}`,
     `ignored_backlog_count: ${bridgeState.ignoredBacklogCount}`,
-    `persisted_shared_thread_id: ${bridgeState.sharedThreadId ?? "(none)"}`,
+    `persisted_shared_session_id: ${persistedSharedSessionId ?? "(none)"}`,
     `worker_status: ${adapterState.status}`,
     `worker_pid: ${adapterState.pid ?? "(unknown)"}`,
-    `shared_thread_id: ${adapterState.sharedThreadId ?? "(none)"}`,
-    `last_thread_switch_at: ${adapterState.lastThreadSwitchAt ?? "(none)"}`,
-    `last_thread_switch_source: ${adapterState.lastThreadSwitchSource ?? "(none)"}`,
-    `last_thread_switch_reason: ${adapterState.lastThreadSwitchReason ?? "(none)"}`,
+    `shared_session_id: ${sharedSessionId ?? "(none)"}`,
+    `last_session_switch_at: ${lastSessionSwitchAt ?? "(none)"}`,
+    `last_session_switch_source: ${lastSessionSwitchSource ?? "(none)"}`,
+    `last_session_switch_reason: ${lastSessionSwitchReason ?? "(none)"}`,
     `active_turn_id: ${adapterState.activeTurnId ?? "(none)"}`,
     `active_turn_origin: ${adapterState.activeTurnOrigin ?? "(none)"}`,
     `pending_approval_origin: ${adapterState.pendingApprovalOrigin ?? "(none)"}`,
@@ -286,43 +300,123 @@ export function formatStatusReport(
   ].join("\n");
 }
 
-export function formatThreadSwitchMessage(params: {
-  threadId: string;
-  source: BridgeThreadSwitchSource;
-  reason: BridgeThreadSwitchReason;
+export function formatSessionSwitchMessage(params: {
+  adapter: BridgeAdapterKind;
+  sessionId: string;
+  source: BridgeSessionSwitchSource;
+  reason: BridgeSessionSwitchReason;
 }): string {
-  const shortThreadId = params.threadId.slice(0, 12);
+  const shortSessionId = params.sessionId.slice(0, 12);
+
+  if (params.adapter === "claude") {
+    switch (params.reason) {
+      case "local_follow":
+      case "local_session_fallback":
+      case "local_turn":
+        return `Claude session switched to ${shortSessionId} from the local terminal.`;
+      case "wechat_resume":
+        return `Claude session switched to ${shortSessionId} from WeChat.`;
+      case "startup_restore":
+        return `Claude restored shared session ${shortSessionId} on startup.`;
+      default:
+        return `Claude session switched to ${shortSessionId}.`;
+    }
+  }
 
   switch (params.reason) {
     case "local_follow":
     case "local_session_fallback":
     case "local_turn":
-      return `Codex thread switched to ${shortThreadId} from the local terminal.`;
+      return `Codex thread switched to ${shortSessionId} from the local terminal.`;
     case "wechat_resume":
-      return `Codex thread switched to ${shortThreadId} from WeChat.`;
+      return `Codex thread switched to ${shortSessionId} from WeChat.`;
     case "startup_restore":
-      return `Codex restored shared thread ${shortThreadId} on startup.`;
+      return `Codex restored shared thread ${shortSessionId} on startup.`;
     default:
-      return `Codex thread switched to ${shortThreadId}.`;
+      return `Codex thread switched to ${shortSessionId}.`;
   }
+}
+
+export function formatThreadSwitchMessage(params: {
+  threadId: string;
+  source: BridgeThreadSwitchSource;
+  reason: BridgeThreadSwitchReason;
+}): string {
+  return formatSessionSwitchMessage({
+    adapter: "codex",
+    sessionId: params.threadId,
+    source: params.source,
+    reason: params.reason,
+  });
+}
+
+export function formatResumeSessionList(params: {
+  adapter: BridgeAdapterKind;
+  candidates: BridgeResumeSessionCandidate[];
+  currentSessionId?: string;
+}): string {
+  const { adapter, candidates, currentSessionId } = params;
+  if (candidates.length === 0) {
+    return adapter === "codex"
+      ? "No saved Codex threads were found for this working directory."
+      : "No saved sessions were found for this working directory.";
+  }
+
+  const title = adapter === "codex" ? "Recent Codex threads:" : "Recent sessions:";
+  const resumeTargetLabel = adapter === "codex" ? "threadId" : "sessionId";
+  return [
+    title,
+    ...candidates.map((candidate, index) => {
+      const marker =
+        currentSessionId && candidate.sessionId === currentSessionId ? " [current]" : "";
+      return `${index + 1}. ${candidate.title} (${candidate.lastUpdatedAt}, ${candidate.sessionId.slice(0, 12)})${marker}`;
+    }),
+    `Reply with /resume <number> or /resume <${resumeTargetLabel}>.`,
+  ].join("\n");
 }
 
 export function formatResumeThreadList(
   candidates: BridgeResumeThreadCandidate[],
   currentThreadId?: string,
 ): string {
-  if (candidates.length === 0) {
-    return "No saved Codex threads were found for this working directory.";
-  }
+  return formatResumeSessionList({
+    adapter: "codex",
+    candidates: candidates.map((candidate) => ({
+      ...candidate,
+      sessionId: candidate.sessionId ?? candidate.threadId ?? "",
+      threadId: candidate.threadId ?? candidate.sessionId,
+    })),
+    currentSessionId: currentThreadId,
+  });
+}
 
-  return [
-    "Recent Codex threads:",
-    ...candidates.map((candidate, index) => {
-      const marker = currentThreadId && candidate.threadId === currentThreadId ? " [current]" : "";
-      return `${index + 1}. ${candidate.title} (${candidate.lastUpdatedAt}, ${candidate.threadId.slice(0, 12)})${marker}`;
-    }),
-    "Reply with /resume <number> or /resume <threadId>.",
-  ].join("\n");
+export function formatMirroredUserInputMessage(
+  adapter: BridgeAdapterKind,
+  text: string,
+): string {
+  const label =
+    adapter === "codex"
+      ? "Local Codex input"
+      : adapter === "claude"
+        ? "Local Claude input"
+        : "Local input";
+  return `${label}:\n${truncatePreview(text, 500)}`;
+}
+
+export function formatFinalReplyMessage(
+  adapter: BridgeAdapterKind,
+  text: string,
+): string {
+  const label = adapter === "codex" ? "Codex" : adapter === "claude" ? "Claude" : adapter;
+  return `${label} final reply:\n${text}`;
+}
+
+export function formatTaskFailedMessage(
+  adapter: BridgeAdapterKind,
+  text: string,
+): string {
+  const label = adapter === "codex" ? "Codex" : adapter === "claude" ? "Claude" : adapter;
+  return `${label} task failed:\n${text}`;
 }
 
 export function formatApprovalMessage(

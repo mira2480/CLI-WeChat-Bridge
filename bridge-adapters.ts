@@ -1,25 +1,40 @@
 import fs from "node:fs";
 import path from "node:path";
 import net from "node:net";
-import { spawn as spawnChild } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { spawn as spawnChild, spawnSync } from "node:child_process";
 import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
 import { spawn as spawnPty } from "node-pty";
 import type { IPty } from "node-pty";
 
 import {
-  attachCodexPanelMessageListener,
-  buildCodexPanelToken,
-  clearCodexPanelEndpoint,
-  sendCodexPanelMessage,
-  writeCodexPanelEndpoint,
-  type CodexPanelCommand,
-  type CodexPanelEndpoint,
-  type CodexPanelMessage,
-} from "./codex-panel-link.ts";
+  attachLocalCompanionMessageListener,
+  buildLocalCompanionToken,
+  clearLocalCompanionEndpoint,
+  sendLocalCompanionMessage,
+  writeLocalCompanionEndpoint,
+  type LocalCompanionCommand,
+  type LocalCompanionEndpoint,
+  type LocalCompanionMessage,
+} from "./local-companion-link.ts";
+import { ensureWorkspaceChannelDir } from "./channel-config.ts";
+import {
+  buildClaudeFailureMessage,
+  buildClaudeHookSettings,
+  buildClaudePermissionDecisionHookOutput,
+  buildClaudePermissionApprovalRequest,
+  extractClaudeResumeConversationId,
+  findInjectedClaudePromptIndex,
+  normalizeClaudeAssistantMessage,
+  parseClaudeHookPayload,
+  type ClaudeHookPayload,
+  type PendingInjectedClaudePrompt,
+} from "./claude-hooks.ts";
 import type {
   ApprovalRequest,
   BridgeAdapter,
   BridgeAdapterKind,
+  BridgeResumeSessionCandidate,
   BridgeResumeThreadCandidate,
   BridgeAdapterState,
   BridgeEvent,
@@ -40,8 +55,11 @@ type AdapterOptions = {
   command: string;
   cwd: string;
   profile?: string;
+  initialSharedSessionId?: string;
   initialSharedThreadId?: string;
-  renderMode?: "embedded" | "panel";
+  initialResumeConversationId?: string;
+  initialTranscriptPath?: string;
+  renderMode?: "embedded" | "panel" | "companion";
 };
 
 type EventSink = (event: BridgeEvent) => void;
@@ -106,8 +124,15 @@ type CodexRecentSessionFile = {
   modifiedAtMs: number;
 };
 
+type ClaudePendingHookApproval = {
+  requestId: string;
+  socket: net.Socket;
+  timer: ReturnType<typeof setTimeout>;
+};
+
 const DEFAULT_COLS = 120;
 const DEFAULT_ROWS = 30;
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS_DIRECT_EXECUTABLE_EXTENSIONS = [".exe", ".cmd", ".bat", ".com"];
 const WINDOWS_POWERSHELL_EXTENSION = ".ps1";
 const CODEX_SESSION_POLL_INTERVAL_MS = 500;
@@ -124,8 +149,12 @@ const CODEX_APP_SERVER_LOG_LIMIT = 12_000;
 const CODEX_RPC_CONNECT_RETRY_MS = 150;
 const CODEX_RPC_RECONNECT_TIMEOUT_MS = 5_000;
 const CODEX_SESSION_LOCAL_MIRROR_FALLBACK_WINDOW_MS = 15_000;
+const CLAUDE_HOOK_LISTEN_HOST = "127.0.0.1";
+const CLAUDE_HELP_PROBE_TIMEOUT_MS = 5_000;
+const CLAUDE_HOOK_APPROVAL_TIMEOUT_MS = 15_000;
 const DEFAULT_UNIX_SHELL_CANDIDATES = ["pwsh", "bash", "zsh", "sh"] as const;
 const POSIX_SHELL_NAMES = new Set(["bash", "zsh", "sh", "dash", "ksh"]);
+const CLAUDE_FLAG_SUPPORT_CACHE = new Map<string, boolean>();
 
 export type ShellRuntimeFamily = "powershell" | "posix";
 
@@ -204,6 +233,29 @@ function normalizeCodexRpcError(error: unknown): string {
   return describeUnknownError(error);
 }
 
+function getLocalCompanionCommandName(kind: BridgeAdapterKind): string {
+  switch (kind) {
+    case "codex":
+      return "wechat-codex";
+    case "claude":
+      return "wechat-claude";
+    default:
+      return "local companion";
+  }
+}
+
+function getSharedSessionIdFromAdapterState(state: BridgeAdapterState): string | undefined {
+  return state.sharedSessionId ?? state.sharedThreadId;
+}
+
+function quoteWindowsCommandArg(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+function quotePosixCommandArg(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 function isRecentIsoTimestamp(timestamp: string, maxAgeMs: number): boolean {
   const parsedMs = Date.parse(timestamp);
   if (!Number.isFinite(parsedMs)) {
@@ -253,6 +305,76 @@ export function buildCodexCliArgs(
   }
 
   return args;
+}
+
+export function hasClaudeNoAltScreenOption(helpText: string): boolean {
+  return helpText.includes("--no-alt-screen");
+}
+
+export function buildClaudeCliArgs(options: {
+  settingsFilePath: string;
+  resumeConversationId?: string | null;
+  profile?: string;
+  includeNoAltScreen?: boolean;
+}): string[] {
+  const args: string[] = [];
+  if (options.includeNoAltScreen) {
+    args.push("--no-alt-screen");
+  }
+  args.push("--settings", options.settingsFilePath);
+  if (options.resumeConversationId) {
+    args.push("--resume", options.resumeConversationId);
+  }
+  if (options.profile) {
+    args.push("--profile", options.profile);
+  }
+  return args;
+}
+
+export function isClaudeInvalidResumeError(text: string): boolean {
+  const normalized = normalizeOutput(text);
+  if (!normalized) {
+    return false;
+  }
+
+  return (
+    normalized.includes("No conversation found with session ID:") ||
+    normalized.includes("No conversation found with session name:") ||
+    normalized.includes("No conversation found with session:")
+  );
+}
+
+function shouldIncludeClaudeNoAltScreen(command: string): boolean {
+  let spawnTarget: SpawnTarget;
+  try {
+    spawnTarget = resolveSpawnTarget(command, "claude");
+  } catch {
+    return false;
+  }
+
+  const cacheKey = `${spawnTarget.file}\u0000${spawnTarget.args.join("\u0000")}`;
+  const cached = CLAUDE_FLAG_SUPPORT_CACHE.get(cacheKey);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  let supported = false;
+  try {
+    const probe = spawnSync(spawnTarget.file, [...spawnTarget.args, "--help"], {
+      cwd: process.cwd(),
+      env: buildCliEnvironment("claude"),
+      encoding: "utf8",
+      timeout: CLAUDE_HELP_PROBE_TIMEOUT_MS,
+      windowsHide: true,
+    });
+    const output = `${probe.stdout ?? ""}\n${probe.stderr ?? ""}`;
+    supported = hasClaudeNoAltScreenOption(output);
+  } catch {
+    supported = false;
+  }
+
+  CLAUDE_FLAG_SUPPORT_CACHE.set(cacheKey, supported);
+  return supported;
 }
 
 export function buildCodexApprovalRequest(
@@ -1269,10 +1391,10 @@ export function findRecentCodexSessionFileForCwd(
   return bestCandidate;
 }
 
-export function listCodexResumeThreads(
+export function listCodexResumeSessions(
   cwd: string,
   limit = 10,
-): BridgeResumeThreadCandidate[] {
+): BridgeResumeSessionCandidate[] {
   const sessionsRoot = buildCodexSessionsRoot();
   if (!sessionsRoot) {
     return [];
@@ -1301,11 +1423,19 @@ export function listCodexResumeThreads(
     .sort((left, right) => Date.parse(right.lastUpdatedAt) - Date.parse(left.lastUpdatedAt))
     .slice(0, Math.max(1, limit))
     .map((summary) => ({
+      sessionId: summary.threadId,
       threadId: summary.threadId,
       title: summary.title,
       lastUpdatedAt: summary.lastUpdatedAt,
       source: summary.source,
     }));
+}
+
+export function listCodexResumeThreads(
+  cwd: string,
+  limit = 10,
+): BridgeResumeThreadCandidate[] {
+  return listCodexResumeSessions(cwd, limit);
 }
 
 export function resolveSpawnTarget(
@@ -1350,7 +1480,7 @@ export function resolveSpawnTarget(
   return { file: resolved, args: [...forwardArgs] };
 }
 
-class CodexPanelProxyAdapter implements BridgeAdapter {
+class LocalCompanionProxyAdapter implements BridgeAdapter {
   private readonly options: AdapterOptions;
   private readonly state: BridgeAdapterState;
   private eventSink: EventSink = () => undefined;
@@ -1358,7 +1488,7 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
   private socket: net.Socket | null = null;
   private detachMessageListener: (() => void) | null = null;
   private requestCounter = 0;
-  private endpoint: CodexPanelEndpoint | null = null;
+  private endpoint: LocalCompanionEndpoint | null = null;
   private readonly pendingRequests = new Map<
     string,
     {
@@ -1376,7 +1506,18 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
       cwd: options.cwd,
       command: options.command,
       profile: options.profile,
-      sharedThreadId: options.initialSharedThreadId,
+      sharedSessionId: options.initialSharedSessionId ?? options.initialSharedThreadId,
+      sharedThreadId:
+        options.kind === "codex"
+          ? options.initialSharedSessionId ?? options.initialSharedThreadId
+          : undefined,
+      activeRuntimeSessionId:
+        options.kind === "claude"
+          ? options.initialSharedSessionId ?? options.initialSharedThreadId
+          : undefined,
+      resumeConversationId:
+        options.kind === "claude" ? options.initialResumeConversationId : undefined,
+      transcriptPath: options.kind === "claude" ? options.initialTranscriptPath : undefined,
     };
   }
 
@@ -1392,7 +1533,7 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
     this.shuttingDown = false;
     this.setStatus(
       "starting",
-      'Waiting for manual Codex panel connection. Run "wechat-codex" in a second terminal for this directory.',
+      `Waiting for manual ${this.options.kind} companion connection. Run "${getLocalCompanionCommandName(this.options.kind)}" in a second terminal for this directory.`,
     );
 
     await new Promise<void>((resolve, reject) => {
@@ -1406,21 +1547,24 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
       server.listen(0, CODEX_APP_SERVER_HOST, () => {
         const address = server.address();
         if (!address || typeof address === "string") {
-          reject(new Error("Failed to allocate a local Codex panel port."));
+          reject(new Error(`Failed to allocate a local ${this.options.kind} companion port.`));
           return;
         }
 
         this.endpoint = {
           instanceId: `${process.pid}-${Date.now().toString(36)}`,
+          kind: this.options.kind,
           port: address.port,
-          token: buildCodexPanelToken(),
+          token: buildLocalCompanionToken(),
           cwd: this.options.cwd,
           command: this.options.command,
           profile: this.options.profile,
-          sharedThreadId: this.state.sharedThreadId,
+          sharedSessionId: getSharedSessionIdFromAdapterState(this.state),
+          resumeConversationId: this.state.resumeConversationId,
+          transcriptPath: this.state.transcriptPath,
           startedAt: nowIso(),
         };
-        writeCodexPanelEndpoint(this.endpoint);
+        writeLocalCompanionEndpoint(this.endpoint);
         resolve();
       });
     });
@@ -1433,18 +1577,18 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
     });
   }
 
-  async listResumeThreads(limit = 10): Promise<BridgeResumeThreadCandidate[]> {
+  async listResumeSessions(limit = 10): Promise<BridgeResumeSessionCandidate[]> {
     const result = await this.sendRequest({
-      command: "list_resume_threads",
+      command: "list_resume_sessions",
       limit,
     });
-    return Array.isArray(result) ? (result as BridgeResumeThreadCandidate[]) : [];
+    return Array.isArray(result) ? (result as BridgeResumeSessionCandidate[]) : [];
   }
 
-  async resumeThread(threadId: string): Promise<void> {
+  async resumeSession(sessionId: string): Promise<void> {
     await this.sendRequest({
-      command: "resume_thread",
-      threadId,
+      command: "resume_session",
+      sessionId,
     });
   }
 
@@ -1471,12 +1615,12 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
 
   async dispose(): Promise<void> {
     this.shuttingDown = true;
-    this.rejectPendingRequests("Codex panel proxy is shutting down.");
-    clearCodexPanelEndpoint(this.options.cwd, this.endpoint?.instanceId);
+    this.rejectPendingRequests(`${this.options.kind} companion proxy is shutting down.`);
+    clearLocalCompanionEndpoint(this.options.cwd, this.endpoint?.instanceId);
 
     if (this.socket) {
       try {
-        sendCodexPanelMessage(this.socket, {
+        sendLocalCompanionMessage(this.socket, {
           type: "request",
           id: `${++this.requestCounter}`,
           payload: { command: "dispose" },
@@ -1518,7 +1662,7 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
 
     let authenticated = false;
     socket.setNoDelay(true);
-    const detachListener = attachCodexPanelMessageListener(socket, (message) => {
+    const detachListener = attachLocalCompanionMessageListener(socket, (message) => {
       if (!authenticated) {
         if (
           message.type !== "hello" ||
@@ -1531,7 +1675,7 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
         authenticated = true;
         this.socket = socket;
         this.detachMessageListener = detachListener;
-        sendCodexPanelMessage(socket, { type: "hello_ack" });
+        sendLocalCompanionMessage(socket, { type: "hello_ack" });
         return;
       }
 
@@ -1544,7 +1688,7 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
         if (!this.shuttingDown) {
           this.setStatus(
             "starting",
-            'Codex panel disconnected. Run "wechat-codex" again in a second terminal for this directory.',
+            `${this.options.kind} companion disconnected. Run "${getLocalCompanionCommandName(this.options.kind)}" again in a second terminal for this directory.`,
           );
         }
       }
@@ -1554,19 +1698,46 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
     });
   }
 
-  private handlePanelMessage(message: CodexPanelMessage): void {
+  private handlePanelMessage(message: LocalCompanionMessage): void {
     switch (message.type) {
       case "event":
         this.eventSink(message.event);
         return;
       case "state":
-        if (
-          this.endpoint &&
-          this.endpoint.sharedThreadId !== message.state.sharedThreadId
-        ) {
-          this.endpoint.sharedThreadId = message.state.sharedThreadId;
-          writeCodexPanelEndpoint(this.endpoint);
+        if (this.endpoint) {
+          const nextSessionId = getSharedSessionIdFromAdapterState(message.state);
+          if (
+            this.endpoint.sharedSessionId !== nextSessionId ||
+            this.endpoint.resumeConversationId !== message.state.resumeConversationId ||
+            this.endpoint.transcriptPath !== message.state.transcriptPath
+          ) {
+            this.endpoint.sharedSessionId = nextSessionId;
+            this.endpoint.sharedThreadId =
+              this.options.kind === "codex" ? nextSessionId : undefined;
+            this.endpoint.resumeConversationId = message.state.resumeConversationId;
+            this.endpoint.transcriptPath = message.state.transcriptPath;
+            writeLocalCompanionEndpoint(this.endpoint);
+          }
         }
+        this.state.pid = undefined;
+        this.state.startedAt = undefined;
+        this.state.lastInputAt = undefined;
+        this.state.lastOutputAt = undefined;
+        this.state.pendingApproval = null;
+        this.state.sharedSessionId = undefined;
+        this.state.sharedThreadId = undefined;
+        this.state.activeRuntimeSessionId = undefined;
+        this.state.resumeConversationId = undefined;
+        this.state.transcriptPath = undefined;
+        this.state.lastSessionSwitchAt = undefined;
+        this.state.lastSessionSwitchSource = undefined;
+        this.state.lastSessionSwitchReason = undefined;
+        this.state.lastThreadSwitchAt = undefined;
+        this.state.lastThreadSwitchSource = undefined;
+        this.state.lastThreadSwitchReason = undefined;
+        this.state.activeTurnId = undefined;
+        this.state.activeTurnOrigin = undefined;
+        this.state.pendingApprovalOrigin = undefined;
         Object.assign(this.state, message.state);
         this.eventSink({
           type: "status",
@@ -1581,7 +1752,9 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
         }
         this.pendingRequests.delete(message.id);
         if (!message.ok) {
-          pending.reject(new Error(message.error ?? "Unknown Codex panel error."));
+          pending.reject(
+            new Error(message.error ?? `Unknown ${this.options.kind} companion error.`),
+          );
           return;
         }
         pending.resolve(message.result);
@@ -1625,15 +1798,15 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
     this.pendingRequests.clear();
   }
 
-  private async sendRequest(payload: CodexPanelCommand): Promise<unknown> {
+  private async sendRequest(payload: LocalCompanionCommand): Promise<unknown> {
     const socket = this.socket;
     if (!socket) {
       throw new Error(
-        'Codex panel is not connected. Run "wechat-codex" in a second terminal for this directory.',
+        `${this.options.kind} companion is not connected. Run "${getLocalCompanionCommandName(this.options.kind)}" in a second terminal for this directory.`,
       );
     }
     if (!this.state.pid && payload.command !== "dispose") {
-      throw new Error("Codex panel is connected but not ready yet. Wait for the panel to finish starting.");
+      throw new Error(`${this.options.kind} companion is connected but not ready yet. Wait for it to finish starting.`);
     }
 
     const id = `${++this.requestCounter}`;
@@ -1641,7 +1814,7 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
       this.pendingRequests.set(id, { resolve, reject });
     });
 
-    sendCodexPanelMessage(socket, {
+    sendLocalCompanionMessage(socket, {
       type: "request",
       id,
       payload,
@@ -1735,11 +1908,11 @@ abstract class AbstractPtyAdapter implements BridgeAdapter {
     this.scheduleTaskComplete(this.defaultCompletionDelayMs());
   }
 
-  async listResumeThreads(_limit = 10): Promise<BridgeResumeThreadCandidate[]> {
+  async listResumeSessions(_limit = 10): Promise<BridgeResumeSessionCandidate[]> {
     throw new Error("/resume is only supported for the codex adapter.");
   }
 
-  async resumeThread(_threadId: string): Promise<void> {
+  async resumeSession(_sessionId: string): Promise<void> {
     throw new Error("/resume is only supported for the codex adapter.");
   }
 
@@ -2011,8 +2184,9 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
 
   constructor(options: AdapterOptions) {
     super(options);
-    this.resumeThreadId = options.initialSharedThreadId ?? null;
+    this.resumeThreadId = options.initialSharedSessionId ?? options.initialSharedThreadId ?? null;
     if (this.resumeThreadId && options.renderMode !== "panel") {
+      this.state.sharedSessionId = this.resumeThreadId;
       this.state.sharedThreadId = this.resumeThreadId;
     }
   }
@@ -2099,11 +2273,11 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     this.writeToPty("\r");
   }
 
-  override async listResumeThreads(limit = 10): Promise<BridgeResumeThreadCandidate[]> {
-    return listCodexResumeThreads(this.options.cwd, limit);
+  override async listResumeSessions(limit = 10): Promise<BridgeResumeSessionCandidate[]> {
+    return listCodexResumeSessions(this.options.cwd, limit);
   }
 
-  override async resumeThread(threadId: string): Promise<void> {
+  override async resumeSession(threadId: string): Promise<void> {
     if (this.isNativePanelMode()) {
       throw new Error(
         'WeChat /resume is disabled in codex mode. Use /resume directly inside "wechat-codex"; WeChat will follow the active local thread.',
@@ -3331,9 +3505,13 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
   ): void {
     const previousThreadId = this.sharedThreadId;
     this.sharedThreadId = threadId;
+    this.state.sharedSessionId = threadId ?? undefined;
     this.state.sharedThreadId = threadId ?? undefined;
     if (threadId && options.source && options.reason) {
       const switchedAt = nowIso();
+      this.state.lastSessionSwitchAt = switchedAt;
+      this.state.lastSessionSwitchSource = options.source;
+      this.state.lastSessionSwitchReason = options.reason;
       this.state.lastThreadSwitchAt = switchedAt;
       this.state.lastThreadSwitchSource = options.source;
       this.state.lastThreadSwitchReason = options.reason;
@@ -4221,13 +4399,744 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
 class CliPtyAdapter extends AbstractPtyAdapter {
   protected buildSpawnArgs(): string[] {
     const args: string[] = [];
-    if (this.options.kind === "claude") {
+    if (
+      this.options.kind === "claude" &&
+      shouldIncludeClaudeNoAltScreen(this.options.command)
+    ) {
       args.push("--no-alt-screen");
     }
     if (this.options.profile) {
       args.push("--profile", this.options.profile);
     }
     return args;
+  }
+}
+
+class ClaudeCompanionAdapter extends AbstractPtyAdapter {
+  private hookServer: net.Server | null = null;
+  private hookPort: number | null = null;
+  private hookToken: string | null = null;
+  private runtimeSessionId: string | null;
+  private resumeConversationId: string | null;
+  private transcriptPath: string | null;
+  private pendingInjectedInputs: PendingInjectedClaudePrompt[] = [];
+  private localTerminalInputListener: ((chunk: string | Buffer) => void) | null = null;
+  private resizeListener: (() => void) | null = null;
+  private settingsFilePath: string | null = null;
+  private readonly pendingHookApprovals = new Map<string, ClaudePendingHookApproval>();
+  private recoveringInvalidResume = false;
+
+  constructor(options: AdapterOptions) {
+    super(options);
+    this.runtimeSessionId = options.initialSharedSessionId ?? options.initialSharedThreadId ?? null;
+    this.resumeConversationId = options.initialResumeConversationId ?? null;
+    this.transcriptPath = options.initialTranscriptPath ?? null;
+    if (this.runtimeSessionId) {
+      this.state.sharedSessionId = this.runtimeSessionId;
+      this.state.activeRuntimeSessionId = this.runtimeSessionId;
+    }
+    if (this.resumeConversationId) {
+      this.state.resumeConversationId = this.resumeConversationId;
+    }
+    if (this.transcriptPath) {
+      this.state.transcriptPath = this.transcriptPath;
+    }
+  }
+
+  override async start(): Promise<void> {
+    if (this.pty) {
+      return;
+    }
+
+    await this.startHookServer();
+    try {
+      await super.start();
+    } catch (error) {
+      await this.stopHookServer();
+      throw error;
+    }
+  }
+
+  override async sendInput(text: string): Promise<void> {
+    if (!this.pty) {
+      throw new Error("claude adapter is not running.");
+    }
+    if (this.state.status === "busy") {
+      throw new Error("claude is still working. Wait for the current reply or use /stop.");
+    }
+    if (this.pendingApproval) {
+      throw new Error("A Claude approval request is pending. Reply with /confirm <code> or /deny.");
+    }
+
+    const normalizedText = normalizeOutput(text).trim();
+    this.pendingInjectedInputs.push({
+      normalizedText,
+      createdAtMs: Date.now(),
+    });
+    this.pendingInjectedInputs = this.pendingInjectedInputs.slice(-8);
+    this.hasAcceptedInput = true;
+    this.currentPreview = truncatePreview(text);
+    this.state.lastInputAt = nowIso();
+    this.state.activeTurnOrigin = "wechat";
+    this.setStatus("busy");
+    this.writeToPty(text.replace(/\r?\n/g, "\r"));
+    this.writeToPty("\r");
+  }
+
+  override async listResumeSessions(_limit = 10): Promise<BridgeResumeSessionCandidate[]> {
+    throw new Error(
+      'WeChat /resume is disabled in claude mode. Use /resume directly inside "wechat-claude"; WeChat will follow the active local session.',
+    );
+  }
+
+  override async resumeSession(_threadId: string): Promise<void> {
+    throw new Error(
+      'WeChat /resume is disabled in claude mode. Use /resume directly inside "wechat-claude"; WeChat will follow the active local session.',
+    );
+  }
+
+  override async interrupt(): Promise<boolean> {
+    if (!this.pty) {
+      return false;
+    }
+    if (this.state.status !== "busy" && this.state.status !== "awaiting_approval") {
+      return false;
+    }
+
+    this.flushPendingClaudeHookApprovals();
+    this.writeToPty("\u0003");
+    return true;
+  }
+
+  override async reset(): Promise<void> {
+    this.runtimeSessionId = null;
+    this.resumeConversationId = null;
+    this.transcriptPath = null;
+    this.state.sharedSessionId = undefined;
+    this.state.sharedThreadId = undefined;
+    this.state.activeRuntimeSessionId = undefined;
+    this.state.resumeConversationId = undefined;
+    this.state.transcriptPath = undefined;
+    this.state.lastSessionSwitchAt = undefined;
+    this.state.lastSessionSwitchSource = undefined;
+    this.state.lastSessionSwitchReason = undefined;
+    await super.reset();
+  }
+
+  override async resolveApproval(action: "confirm" | "deny"): Promise<boolean> {
+    if (!this.pendingApproval) {
+      return false;
+    }
+
+    if (this.pendingApproval.requestId) {
+      const handled = this.respondToClaudeHookApproval(this.pendingApproval.requestId, action);
+      if (handled) {
+        this.pendingApproval = null;
+        this.state.pendingApproval = null;
+        this.state.pendingApprovalOrigin = undefined;
+        this.setStatus("busy");
+        return true;
+      }
+    }
+
+    const input =
+      action === "confirm" ? this.pendingApproval.confirmInput : this.pendingApproval.denyInput;
+    if (!input) {
+      throw new Error(
+        "Remote approval is not safely available for this Claude prompt. Approve it in the local Claude terminal.",
+      );
+    }
+
+    this.pendingApproval = null;
+    this.state.pendingApproval = null;
+    this.state.pendingApprovalOrigin = undefined;
+    this.setStatus("busy");
+    this.writeToPty(input);
+    return true;
+  }
+
+  override async dispose(): Promise<void> {
+    this.detachLocalTerminal();
+    this.flushPendingClaudeHookApprovals();
+    await super.dispose();
+    await this.stopHookServer();
+  }
+
+  protected buildSpawnArgs(): string[] {
+    if (!this.settingsFilePath) {
+      throw new Error("Claude companion settings are not ready.");
+    }
+
+    return buildClaudeCliArgs({
+      settingsFilePath: this.settingsFilePath,
+      resumeConversationId: this.resumeConversationId,
+      profile: this.options.profile,
+      includeNoAltScreen: shouldIncludeClaudeNoAltScreen(this.options.command),
+    });
+  }
+
+  protected override afterStart(): void {
+    this.attachLocalTerminal();
+    this.resizePtyToTerminal();
+  }
+
+  protected override handleData(rawText: string): void {
+    this.renderLocalOutput(rawText);
+
+    const text = normalizeOutput(rawText);
+    if (!text) {
+      return;
+    }
+
+    if (
+      this.resumeConversationId &&
+      !this.hasAcceptedInput &&
+      !this.recoveringInvalidResume &&
+      isClaudeInvalidResumeError(text)
+    ) {
+      void this.recoverFromInvalidResume(this.resumeConversationId);
+      return;
+    }
+
+    this.state.lastOutputAt = nowIso();
+    const approval = detectCliApproval(text);
+    if (approval) {
+      if (this.pendingApproval) {
+        this.pendingApproval = {
+          ...this.pendingApproval,
+          confirmInput: this.pendingApproval.confirmInput ?? approval.confirmInput,
+          denyInput: this.pendingApproval.denyInput ?? approval.denyInput,
+        };
+        this.state.pendingApproval = this.pendingApproval;
+      } else {
+        this.pendingApproval = approval;
+        this.state.pendingApproval = approval;
+        this.state.pendingApprovalOrigin = this.state.activeTurnOrigin;
+        this.setStatus("awaiting_approval", "Claude approval is required.");
+        this.emit({
+          type: "approval_required",
+          request: approval,
+          timestamp: nowIso(),
+        });
+      }
+      return;
+    }
+
+    if (!this.hasAcceptedInput) {
+      return;
+    }
+
+    this.emit({
+      type: "stdout",
+      text,
+      timestamp: nowIso(),
+    });
+  }
+
+  protected override handleExit(exitCode: number | undefined): void {
+    this.detachLocalTerminal();
+    void this.stopHookServer();
+    if (this.recoveringInvalidResume && !this.shuttingDown) {
+      this.clearCompletionTimer();
+      this.pty = null;
+      this.state.status = "stopped";
+      this.state.pid = undefined;
+      this.pendingApproval = null;
+      this.state.pendingApproval = null;
+      return;
+    }
+    super.handleExit(exitCode);
+  }
+
+  private async startHookServer(): Promise<void> {
+    if (this.hookServer) {
+      return;
+    }
+
+    this.hookToken = buildLocalCompanionToken();
+    await new Promise<void>((resolve, reject) => {
+      const server = net.createServer((socket) => {
+        let buffer = "";
+        socket.setEncoding("utf8");
+        socket.on("data", (chunk) => {
+          buffer += chunk;
+          while (true) {
+            const newlineIndex = buffer.indexOf("\n");
+            if (newlineIndex < 0) {
+              break;
+            }
+
+            const line = buffer.slice(0, newlineIndex).trim();
+            buffer = buffer.slice(newlineIndex + 1);
+            if (!line) {
+              continue;
+            }
+
+            try {
+              const envelope = JSON.parse(line) as {
+                token?: string;
+                requestId?: string;
+                payload?: string;
+              };
+              if (
+                envelope.token === this.hookToken &&
+                typeof envelope.requestId === "string" &&
+                typeof envelope.payload === "string"
+              ) {
+                this.handleClaudeHookEnvelope({
+                  requestId: envelope.requestId,
+                  rawPayload: envelope.payload,
+                  socket,
+                });
+              }
+            } catch {
+              // Ignore malformed hook payloads.
+            }
+          }
+        });
+        const cleanupPendingRequestsForSocket = () => {
+          for (const [requestId, pending] of this.pendingHookApprovals.entries()) {
+            if (pending.socket === socket) {
+              clearTimeout(pending.timer);
+              this.pendingHookApprovals.delete(requestId);
+            }
+          }
+        };
+        socket.once("close", cleanupPendingRequestsForSocket);
+        socket.once("error", cleanupPendingRequestsForSocket);
+      });
+
+      this.hookServer = server;
+      server.once("error", (error) => {
+        reject(error);
+      });
+      server.listen(0, CLAUDE_HOOK_LISTEN_HOST, () => {
+        const address = server.address();
+        if (!address || typeof address === "string") {
+          reject(new Error("Failed to allocate a local Claude hook port."));
+          return;
+        }
+
+        this.hookPort = address.port;
+        try {
+          this.writeClaudeRuntimeFiles();
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+  }
+
+  private async stopHookServer(): Promise<void> {
+    this.flushPendingClaudeHookApprovals();
+    if (!this.hookServer) {
+      this.hookPort = null;
+      this.settingsFilePath = null;
+      return;
+    }
+
+    const server = this.hookServer;
+    this.hookServer = null;
+    this.hookPort = null;
+    this.settingsFilePath = null;
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    });
+  }
+
+  private writeClaudeRuntimeFiles(): void {
+    if (!this.hookPort || !this.hookToken) {
+      throw new Error("Claude hook server is not ready.");
+    }
+
+    const { workspaceDir } = ensureWorkspaceChannelDir(this.options.cwd);
+    const runtimeDir = path.join(workspaceDir, "claude-runtime");
+    fs.mkdirSync(runtimeDir, { recursive: true });
+
+    const hookScriptPath = path.join(
+      runtimeDir,
+      process.platform === "win32" ? "hook.cmd" : "hook.sh",
+    );
+    const settingsFilePath = path.join(runtimeDir, "settings.json");
+    const hookEntryPath = path.join(MODULE_DIR, "claude-hook.ts");
+
+    if (process.platform === "win32") {
+      fs.writeFileSync(
+        hookScriptPath,
+        [
+          "@echo off",
+          "setlocal",
+          `set "CLAUDE_WECHAT_HOOK_PORT=${this.hookPort}"`,
+          `set "CLAUDE_WECHAT_HOOK_TOKEN=${this.hookToken}"`,
+          `${quoteWindowsCommandArg(process.execPath)} --no-warnings --experimental-strip-types ${quoteWindowsCommandArg(hookEntryPath)} >nul 2>nul`,
+          "exit /b 0",
+        ].join("\r\n"),
+        "utf8",
+      );
+    } else {
+      fs.writeFileSync(
+        hookScriptPath,
+        [
+          "#!/bin/sh",
+          `export CLAUDE_WECHAT_HOOK_PORT=${quotePosixCommandArg(String(this.hookPort))}`,
+          `export CLAUDE_WECHAT_HOOK_TOKEN=${quotePosixCommandArg(this.hookToken)}`,
+          `${quotePosixCommandArg(process.execPath)} --no-warnings --experimental-strip-types ${quotePosixCommandArg(hookEntryPath)} >/dev/null 2>&1 || true`,
+          "exit 0",
+        ].join("\n"),
+        "utf8",
+      );
+      fs.chmodSync(hookScriptPath, 0o755);
+    }
+
+    const hookCommand =
+      process.platform === "win32"
+        ? quoteWindowsCommandArg(hookScriptPath)
+        : quotePosixCommandArg(hookScriptPath);
+    fs.writeFileSync(
+      settingsFilePath,
+      JSON.stringify(buildClaudeHookSettings(hookCommand), null, 2),
+      "utf8",
+    );
+    this.settingsFilePath = settingsFilePath;
+  }
+
+  private attachLocalTerminal(): void {
+    if (this.localTerminalInputListener || !this.pty) {
+      return;
+    }
+
+    this.localTerminalInputListener = (chunk) => {
+      const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      this.writeToPty(text);
+    };
+    process.stdin.on("data", this.localTerminalInputListener);
+    process.stdin.resume();
+    if (process.stdin.isTTY && typeof process.stdin.setRawMode === "function") {
+      process.stdin.setRawMode(true);
+    }
+
+    this.resizeListener = () => {
+      this.resizePtyToTerminal();
+    };
+    if (process.stdout.isTTY) {
+      process.stdout.on("resize", this.resizeListener);
+    }
+  }
+
+  private detachLocalTerminal(): void {
+    if (this.localTerminalInputListener) {
+      process.stdin.off("data", this.localTerminalInputListener);
+      this.localTerminalInputListener = null;
+    }
+    if (this.resizeListener) {
+      process.stdout.off("resize", this.resizeListener);
+      this.resizeListener = null;
+    }
+    if (process.stdin.isTTY && typeof process.stdin.setRawMode === "function") {
+      process.stdin.setRawMode(false);
+    }
+  }
+
+  private resizePtyToTerminal(): void {
+    if (!this.pty || !process.stdout.isTTY) {
+      return;
+    }
+
+    try {
+      this.pty.resize(process.stdout.columns || DEFAULT_COLS, process.stdout.rows || DEFAULT_ROWS);
+    } catch {
+      // Best effort resize sync.
+    }
+  }
+
+  private renderLocalOutput(rawText: string): void {
+    try {
+      process.stdout.write(rawText);
+    } catch {
+      // Best effort local mirroring for the visible Claude companion.
+    }
+  }
+
+  private handleClaudeHookEnvelope(params: {
+    requestId: string;
+    rawPayload: string;
+    socket: net.Socket;
+  }): void {
+    const payload = parseClaudeHookPayload(params.rawPayload);
+    if (!payload?.hook_event_name) {
+      this.respondToClaudeHook(params.socket, params.requestId);
+      return;
+    }
+
+    switch (payload.hook_event_name) {
+      case "SessionStart":
+        this.handleClaudeSessionStart(payload);
+        this.respondToClaudeHook(params.socket, params.requestId);
+        return;
+      case "UserPromptSubmit":
+        this.handleClaudeUserPromptSubmit(payload);
+        this.respondToClaudeHook(params.socket, params.requestId);
+        return;
+      case "PermissionRequest":
+        this.handleClaudePermissionRequest(params.requestId, payload, params.socket);
+        return;
+      case "Notification":
+        if (payload.notification_type === "permission_prompt" && this.pendingApproval) {
+          this.setStatus("awaiting_approval", "Claude approval is required.");
+        }
+        this.respondToClaudeHook(params.socket, params.requestId);
+        return;
+      case "Stop":
+        this.handleClaudeStop(payload);
+        this.respondToClaudeHook(params.socket, params.requestId);
+        return;
+      case "StopFailure":
+        this.handleClaudeStopFailure(payload);
+        this.respondToClaudeHook(params.socket, params.requestId);
+        return;
+      default:
+        this.respondToClaudeHook(params.socket, params.requestId);
+        return;
+    }
+  }
+
+  private handleClaudeSessionStart(payload: {
+    session_id?: string;
+    source?: string;
+    transcript_path?: string;
+  }): void {
+    if (!payload.session_id) {
+      return;
+    }
+
+    const previousRuntimeSessionId = this.runtimeSessionId;
+    const previousResumeConversationId = this.resumeConversationId;
+    const nextTranscriptPath =
+      typeof payload.transcript_path === "string" && payload.transcript_path.trim()
+        ? payload.transcript_path.trim()
+        : null;
+    const nextResumeConversationId = extractClaudeResumeConversationId(
+      nextTranscriptPath ?? undefined,
+    );
+
+    this.runtimeSessionId = payload.session_id;
+    this.state.sharedSessionId = payload.session_id;
+    this.state.activeRuntimeSessionId = payload.session_id;
+    this.state.sharedThreadId = undefined;
+    this.resumeConversationId = nextResumeConversationId;
+    this.state.resumeConversationId = nextResumeConversationId ?? undefined;
+    this.transcriptPath = nextTranscriptPath;
+    this.state.transcriptPath = nextTranscriptPath ?? undefined;
+
+    if (previousRuntimeSessionId === payload.session_id) {
+      return;
+    }
+
+    const timestamp = nowIso();
+    const isRestore =
+      !previousRuntimeSessionId &&
+      (payload.source === "resume" ||
+        (nextResumeConversationId !== null &&
+          nextResumeConversationId === previousResumeConversationId));
+    const source: BridgeThreadSwitchSource = isRestore ? "restore" : "local";
+    const reason: BridgeThreadSwitchReason = isRestore ? "startup_restore" : "local_follow";
+    this.state.lastSessionSwitchAt = timestamp;
+    this.state.lastSessionSwitchSource = source;
+    this.state.lastSessionSwitchReason = reason;
+    this.emit({
+      type: "session_switched",
+      sessionId: payload.session_id,
+      source,
+      reason,
+      timestamp,
+    });
+  }
+
+  private handleClaudeUserPromptSubmit(payload: { prompt?: string }): void {
+    const prompt =
+      typeof payload.prompt === "string" ? normalizeOutput(payload.prompt).trim() : "";
+    if (!prompt) {
+      return;
+    }
+
+    const injectedIndex = findInjectedClaudePromptIndex(prompt, this.pendingInjectedInputs);
+    if (injectedIndex >= 0) {
+      this.pendingInjectedInputs.splice(injectedIndex, 1);
+      return;
+    }
+
+    this.hasAcceptedInput = true;
+    this.currentPreview = truncatePreview(prompt);
+    this.state.lastInputAt = nowIso();
+    this.state.activeTurnOrigin = "local";
+    this.setStatus("busy");
+    this.emit({
+      type: "mirrored_user_input",
+      text: prompt,
+      origin: "local",
+      timestamp: nowIso(),
+    });
+  }
+
+  private async recoverFromInvalidResume(failedResumeConversationId: string): Promise<void> {
+    if (this.recoveringInvalidResume) {
+      return;
+    }
+
+    this.recoveringInvalidResume = true;
+    this.flushPendingClaudeHookApprovals();
+    this.pendingApproval = null;
+    this.state.pendingApproval = null;
+    this.state.pendingApprovalOrigin = undefined;
+    this.runtimeSessionId = null;
+    this.resumeConversationId = null;
+    this.transcriptPath = null;
+    this.state.sharedSessionId = undefined;
+    this.state.sharedThreadId = undefined;
+    this.state.activeRuntimeSessionId = undefined;
+    this.state.resumeConversationId = undefined;
+    this.state.transcriptPath = undefined;
+    this.state.lastSessionSwitchAt = undefined;
+    this.state.lastSessionSwitchSource = undefined;
+    this.state.lastSessionSwitchReason = undefined;
+    this.emit({
+      type: "stdout",
+      text: `Saved Claude conversation ${failedResumeConversationId} is no longer available. Starting a fresh Claude session.`,
+      timestamp: nowIso(),
+    });
+
+    try {
+      await super.reset();
+    } finally {
+      this.recoveringInvalidResume = false;
+    }
+  }
+
+  private handleClaudePermissionRequest(
+    requestId: string,
+    payload: ClaudeHookPayload,
+    socket: net.Socket,
+  ): void {
+    this.flushPendingClaudeHookApprovals();
+    const timer = setTimeout(() => {
+      this.respondToClaudeHook(socket, requestId);
+      this.pendingHookApprovals.delete(requestId);
+    }, CLAUDE_HOOK_APPROVAL_TIMEOUT_MS);
+    timer.unref?.();
+    this.pendingHookApprovals.set(requestId, {
+      requestId,
+      socket,
+      timer,
+    });
+    const request = buildClaudePermissionApprovalRequest(payload);
+    this.pendingApproval = {
+      ...request,
+      requestId,
+      confirmInput: this.pendingApproval?.confirmInput,
+      denyInput: this.pendingApproval?.denyInput,
+    };
+    this.state.pendingApproval = this.pendingApproval;
+    this.state.pendingApprovalOrigin = this.state.activeTurnOrigin;
+    this.setStatus("awaiting_approval", "Claude approval is required.");
+    this.emit({
+      type: "approval_required",
+      request: this.pendingApproval,
+      timestamp: nowIso(),
+    });
+  }
+
+  private handleClaudeStop(payload: { last_assistant_message?: string }): void {
+    this.flushPendingClaudeHookApprovals();
+    this.pendingApproval = null;
+    this.state.pendingApproval = null;
+    this.state.pendingApprovalOrigin = undefined;
+    this.state.activeTurnOrigin = undefined;
+    this.hasAcceptedInput = false;
+    this.setStatus("idle");
+    this.emit({
+      type: "final_reply",
+      text: normalizeClaudeAssistantMessage(payload),
+      timestamp: nowIso(),
+    });
+    this.emit({
+      type: "task_complete",
+      summary: this.currentPreview,
+      timestamp: nowIso(),
+    });
+    this.currentPreview = "(idle)";
+  }
+
+  private handleClaudeStopFailure(payload: {
+    error?: string;
+    error_details?: string;
+    last_assistant_message?: string;
+  }): void {
+    this.flushPendingClaudeHookApprovals();
+    this.pendingApproval = null;
+    this.state.pendingApproval = null;
+    this.state.pendingApprovalOrigin = undefined;
+    this.state.activeTurnOrigin = undefined;
+    this.hasAcceptedInput = false;
+    this.setStatus("idle");
+    this.emit({
+      type: "task_failed",
+      message: buildClaudeFailureMessage(payload),
+      timestamp: nowIso(),
+    });
+    this.currentPreview = "(idle)";
+  }
+
+  private respondToClaudeHook(
+    socket: net.Socket,
+    requestId: string,
+    stdout?: string,
+  ): void {
+    try {
+      socket.end(`${JSON.stringify({ requestId, stdout })}\n`);
+    } catch {
+      try {
+        socket.destroy();
+      } catch {
+        // Best effort cleanup.
+      }
+    }
+  }
+
+  private respondToClaudeHookApproval(
+    requestId: string,
+    action: "confirm" | "deny",
+  ): boolean {
+    const pending = this.pendingHookApprovals.get(requestId);
+    if (!pending) {
+      return false;
+    }
+
+    clearTimeout(pending.timer);
+    this.pendingHookApprovals.delete(requestId);
+    this.respondToClaudeHook(
+      pending.socket,
+      requestId,
+      buildClaudePermissionDecisionHookOutput(action),
+    );
+    return true;
+  }
+
+  private cancelPendingClaudeHookApproval(requestId: string): void {
+    const pending = this.pendingHookApprovals.get(requestId);
+    if (!pending) {
+      return;
+    }
+
+    clearTimeout(pending.timer);
+    this.respondToClaudeHook(pending.socket, requestId);
+    this.pendingHookApprovals.delete(requestId);
+  }
+
+  private flushPendingClaudeHookApprovals(): void {
+    for (const requestId of Array.from(this.pendingHookApprovals.keys())) {
+      this.cancelPendingClaudeHookApproval(requestId);
+    }
   }
 }
 
@@ -4420,9 +5329,11 @@ export function createBridgeAdapter(options: AdapterOptions): BridgeAdapter {
     case "codex":
       return options.renderMode === "panel"
         ? new CodexPtyAdapter(options)
-        : new CodexPanelProxyAdapter(options);
+        : new LocalCompanionProxyAdapter(options);
     case "claude":
-      return new CliPtyAdapter(options);
+      return options.renderMode === "companion"
+        ? new ClaudeCompanionAdapter(options)
+        : new LocalCompanionProxyAdapter(options);
     case "shell":
       return new ShellAdapter(options);
     default:

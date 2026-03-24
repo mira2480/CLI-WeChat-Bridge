@@ -2,4 +2,4 @@
 
 import { runTsEntry } from "./_run-entry.mjs";
 
-runTsEntry("local-companion.ts", ["--adapter", "codex"]);
+runTsEntry("local-companion.ts", ["--adapter", "claude"]);
