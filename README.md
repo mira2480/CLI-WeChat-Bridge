@@ -1,14 +1,9 @@
 # CLI WeChat Bridge 
-**命令行工具的微信桥接**：将微信接入本地 AI 编码工作流的桥接工具。现在支持微信接入Codex的体验接近原生。
+**命令行工具的微信桥接**：
 
-> Platform support:
-> - Windows: primary validated native platform.
-> - Linux/macOS: native support is available for `codex`, `claude`, and `shell`.
-> - Non-Windows `shell` defaults to `pwsh`, then `bash`, `zsh`, and `sh`.
+本项目用于桥接微信消息与本地运行的 [`Codex`](https://github.com/openai/codex)、[`Claude Code`](https://code.claude.com/docs/en/overview) 或持久化 `powershell.exe` 会话，并将本地输出、审批请求与运行状态同步回微信。
 
-
-
-本项目用于桥接微信消息与本地运行的 [`codex`](https://github.com/openai/codex)、[`Claude Code`](https://code.claude.com/docs/en/overview) 或持久化 `powershell.exe` 会话，并将本地输出、审批请求与运行状态同步回微信。当前实现以 `codex` 工作流为中心展开，重点是保留本地原生终端体验，并在此基础上提供微信侧的远程输入、结果回流与状态同步能力。
+当前实现以 `Codex` 工作流为中心展开，重点是保留本地原生终端体验，并在此基础上提供微信侧的远程输入、结果回流与状态同步能力。(Codex的体验接近原生。)
 
 > 当前支持状态说明  
 > - `codex`：当前优先支持的适配器，功能链路最完整，完成度最高（也许是目前最接近原生体验的项目）
@@ -251,7 +246,7 @@ wechat-codex --cwd D:\work\my-project
 | `/deny` | 拒绝审批 |
 | `/resume` | 在 `codex` 模式下禁用；请在本地 `wechat-codex` 中执行 |
 
-## `codex` 模式说明
+## `Codex` 模式说明
 
 ### 双终端结构
 
@@ -362,9 +357,6 @@ Codex 的正常会话历史仍由 Codex 自身维护，默认保存在：
 /deny
 ```
 
-### 本地通信范围
-
-Codex 的 app-server 与 panel 之间的通信只监听 `127.0.0.1`，不默认暴露到公网。
 
 ## 常见问题
 
@@ -414,7 +406,7 @@ npm link
 
 该提示只应在当前确实存在活动任务时出现。
 
-如果已经升级到最新版本但仍偶发出现：
+如果偶发出现：
 
 1. 先确认本地 `wechat-codex` 是否真的仍在执行任务
 2. 必要时使用 `/stop`
@@ -497,13 +489,16 @@ bun test
 
 ## 致谢
 
-本项目直接依赖并集成了以下开源项目：
+- [Linux DO](https://linux.do/)：学AI，上L站！
 
-- [openclaw-weixin](https://github.com/hao-ji-xing/openclaw-weixin)：部分微信 ClawBot 的源码,感谢开源！
+- [openclaw-weixin](https://github.com/hao-ji-xing/openclaw-weixin)：支持Claude Code Channel,感谢如此迅速的开源。
 
 - [@modelcontextprotocol/sdk](https://github.com/modelcontextprotocol/typescript-sdk)：TypeScript 版 MCP SDK
+
 - [node-pty](https://github.com/microsoft/node-pty)：本地 PTY / ConPTY 进程桥接
+
 - [@anthropic-ai/sdk](https://github.com/anthropics/anthropic-sdk-typescript)：Anthropic TypeScript SDK
+
 - [qrcode-terminal](https://github.com/gtanner/qrcode-terminal)：终端二维码输出
 
 ## License
