@@ -145,6 +145,7 @@ wechat-claude
 ![alt text](docs/images/image-6.png)
 
 
+![alt text](docs/images/image-7.png)
 
 ## 适配器支持情况
 
