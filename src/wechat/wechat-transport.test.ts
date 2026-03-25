@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 
 import {
   assertMediaUploadSizeAllowed,
+  classifyWechatTransportError,
+  describeWechatTransportError,
   formatByteSize,
   resolveMediaUploadLimitBytes,
 } from "./wechat-transport.ts";
@@ -44,5 +46,36 @@ describe("wechat upload limits", () => {
     expect(formatByteSize(512)).toBe("512 B");
     expect(formatByteSize(1_536)).toBe("1.5 KB");
     expect(formatByteSize(20 * 1024 * 1024)).toBe("20.0 MB");
+  });
+
+  test("classifies transient fetch failures as retryable network errors", () => {
+    const cause = Object.assign(new Error("connect ETIMEDOUT 10.0.0.1:443"), {
+      code: "ETIMEDOUT",
+      syscall: "connect",
+      address: "10.0.0.1",
+      port: 443,
+    });
+    const error = new TypeError("fetch failed", { cause });
+
+    expect(classifyWechatTransportError(error)).toEqual({
+      kind: "network",
+      retryable: true,
+    });
+    expect(describeWechatTransportError(error)).toContain("TypeError: fetch failed");
+    expect(describeWechatTransportError(error)).toContain("code=ETIMEDOUT");
+  });
+
+  test("treats HTTP 503 as retryable and HTTP 401 as fatal auth", () => {
+    expect(classifyWechatTransportError(new Error("HTTP 503: upstream unavailable"))).toEqual({
+      kind: "http",
+      retryable: true,
+      statusCode: 503,
+    });
+
+    expect(classifyWechatTransportError(new Error("HTTP 401: unauthorized"))).toEqual({
+      kind: "auth",
+      retryable: false,
+      statusCode: 401,
+    });
   });
 });

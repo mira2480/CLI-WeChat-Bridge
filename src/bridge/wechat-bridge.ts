@@ -6,6 +6,7 @@ import {
   createBridgeAdapter,
   resolveDefaultAdapterCommand,
 } from "./bridge-adapters.ts";
+import { delay } from "./bridge-adapters.shared.ts";
 import { forwardWechatFinalReply } from "./bridge-final-reply.ts";
 import { migrateLegacyChannelFiles } from "../wechat/channel-config.ts";
 import { BridgeStateStore } from "./bridge-state.ts";
@@ -30,8 +31,10 @@ import {
   truncatePreview,
 } from "./bridge-utils.ts";
 import {
+  classifyWechatTransportError,
   DEFAULT_LONG_POLL_TIMEOUT_MS,
   WeChatTransport,
+  describeWechatTransportError,
   type InboundWechatMessage,
 } from "../wechat/wechat-transport.ts";
 
@@ -47,12 +50,21 @@ type ActiveTask = {
   inputPreview: string;
 };
 
+const POLL_RETRY_BASE_MS = 1_000;
+const POLL_RETRY_MAX_MS = 30_000;
+
 function log(message: string): void {
   process.stderr.write(`[wechat-bridge] ${message}\n`);
 }
 
 function logError(message: string): void {
   process.stderr.write(`[wechat-bridge] ERROR: ${message}\n`);
+}
+
+function computePollRetryDelayMs(consecutiveFailures: number): number {
+  const normalizedFailures = Math.max(1, consecutiveFailures);
+  const exponent = Math.min(normalizedFailures - 1, 5);
+  return Math.min(POLL_RETRY_MAX_MS, POLL_RETRY_BASE_MS * 2 ** exponent);
 }
 
 function parseCliArgs(argv: string[]): BridgeCliOptions {
@@ -167,6 +179,7 @@ async function main(): Promise<void> {
   let activeTask: ActiveTask | null = null;
   let lastOutputAt = 0;
   let lastHeartbeatAt = 0;
+  let consecutivePollFailures = 0;
 
   const queueWechatTextAction = <T>(action: () => Promise<T>) => {
     const run = textSendChain.then(action);
@@ -188,7 +201,7 @@ async function main(): Promise<void> {
 
   const queueWechatMessage = (senderId: string, text: string) => {
     return queueWechatTextAction(() => transport.sendText(senderId, text)).catch((err) => {
-      logError(`Failed to send WeChat reply: ${String(err)}`);
+      logError(`Failed to send WeChat reply: ${describeWechatTransportError(err)}`);
     });
   };
 
@@ -271,10 +284,41 @@ async function main(): Promise<void> {
     }
 
     while (true) {
-      const pollResult = await transport.pollMessages({
-        timeoutMs: DEFAULT_LONG_POLL_TIMEOUT_MS,
-        minCreatedAtMs: stateStore.getState().bridgeStartedAtMs - MESSAGE_START_GRACE_MS,
-      });
+      let pollResult: Awaited<ReturnType<WeChatTransport["pollMessages"]>>;
+      try {
+        pollResult = await transport.pollMessages({
+          timeoutMs: DEFAULT_LONG_POLL_TIMEOUT_MS,
+          minCreatedAtMs: stateStore.getState().bridgeStartedAtMs - MESSAGE_START_GRACE_MS,
+        });
+      } catch (err) {
+        const classification = classifyWechatTransportError(err);
+        if (!classification.retryable) {
+          throw err;
+        }
+
+        consecutivePollFailures += 1;
+        const delayMs = computePollRetryDelayMs(consecutivePollFailures);
+        const errorText = describeWechatTransportError(err);
+        const statusDetails =
+          typeof classification.statusCode === "number"
+            ? ` status=${classification.statusCode}`
+            : "";
+        logError(
+          `WeChat long poll failed (${classification.kind}${statusDetails}, attempt ${consecutivePollFailures}). Retrying in ${formatDuration(delayMs)}. ${errorText}`,
+        );
+        stateStore.appendLog(
+          `poll_retry: kind=${classification.kind}${statusDetails} attempt=${consecutivePollFailures} delay_ms=${delayMs} error=${truncatePreview(errorText, 400)}`,
+        );
+        await delay(delayMs);
+        continue;
+      }
+
+      if (consecutivePollFailures > 0) {
+        const recoveredFailures = consecutivePollFailures;
+        consecutivePollFailures = 0;
+        log(`WeChat long poll recovered after ${recoveredFailures} transient error(s).`);
+        stateStore.appendLog(`poll_recovered: failures=${recoveredFailures}`);
+      }
 
       if (pollResult.ignoredBacklogCount > 0) {
         stateStore.incrementIgnoredBacklog(pollResult.ignoredBacklogCount);
@@ -712,6 +756,6 @@ async function handleInboundMessage(params: {
 }
 
 main().catch((err) => {
-  logError(String(err));
+  logError(describeWechatTransportError(err));
   process.exit(1);
 });

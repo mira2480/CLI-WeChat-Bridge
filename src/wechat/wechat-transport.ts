@@ -19,6 +19,7 @@ const RECENT_MESSAGE_CACHE_SIZE = 500;
 const BYTES_PER_MB = 1024 * 1024;
 const SEND_TIMEOUT_MS = 15_000;
 const CDN_MAX_RETRIES = 3;
+const ERROR_CAUSE_DEPTH_LIMIT = 4;
 
 const MSG_TYPE_USER = 1;
 const MSG_TYPE_BOT = 2;
@@ -141,6 +142,19 @@ type UploadPreparation = {
   downloadParam: string;
 };
 
+export type WechatTransportErrorKind =
+  | "timeout"
+  | "network"
+  | "http"
+  | "auth"
+  | "unknown";
+
+export type WechatTransportErrorClassification = {
+  kind: WechatTransportErrorKind;
+  retryable: boolean;
+  statusCode?: number;
+};
+
 const DEFAULT_MEDIA_UPLOAD_LIMIT_MB: Record<UploadLabel, number> = {
   image: 20,
   file: 50,
@@ -155,6 +169,50 @@ const MEDIA_UPLOAD_LIMIT_ENV_KEYS: Record<UploadLabel, string> = {
   video: "WECHAT_MAX_VIDEO_MB",
 };
 
+const RETRYABLE_HTTP_STATUS_CODES = new Set([408, 425, 429]);
+const RETRYABLE_NETWORK_ERROR_CODES = new Set([
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "EPIPE",
+  "ETIMEDOUT",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_SOCKET",
+]);
+const RETRYABLE_NETWORK_ERROR_HINTS = [
+  "connection closed",
+  "connection reset",
+  "connection refused",
+  "econnaborted",
+  "econnrefused",
+  "econnreset",
+  "ehostunreach",
+  "enetunreach",
+  "enotfound",
+  "eai_again",
+  "fetch failed",
+  "network error",
+  "request timeout",
+  "socket hang up",
+  "timed out",
+  "timeout",
+];
+
+type ErrorWithCause = Error & {
+  cause?: unknown;
+  code?: unknown;
+  errno?: unknown;
+  syscall?: unknown;
+  hostname?: unknown;
+  address?: unknown;
+  port?: unknown;
+};
+
 function readJsonFile<T>(filePath: string): T | null {
   try {
     if (!fs.existsSync(filePath)) {
@@ -164,6 +222,174 @@ function readJsonFile<T>(filePath: string): T | null {
   } catch {
     return null;
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function describeErrorNode(value: unknown): string {
+  if (value instanceof Error) {
+    const error = value as ErrorWithCause;
+    const parts: string[] = [];
+    if (error.name && error.message) {
+      parts.push(`${error.name}: ${error.message}`);
+    } else if (error.message) {
+      parts.push(error.message);
+    } else if (error.name) {
+      parts.push(error.name);
+    }
+    if (typeof error.code === "string" && error.code.trim()) {
+      parts.push(`code=${error.code}`);
+    }
+    if (
+      (typeof error.errno === "string" && error.errno.trim()) ||
+      typeof error.errno === "number"
+    ) {
+      parts.push(`errno=${error.errno}`);
+    }
+    if (typeof error.syscall === "string" && error.syscall.trim()) {
+      parts.push(`syscall=${error.syscall}`);
+    }
+    if (typeof error.hostname === "string" && error.hostname.trim()) {
+      parts.push(`host=${error.hostname}`);
+    }
+    if (typeof error.address === "string" && error.address.trim()) {
+      parts.push(`address=${error.address}`);
+    }
+    if (
+      (typeof error.port === "string" && error.port.trim()) ||
+      typeof error.port === "number"
+    ) {
+      parts.push(`port=${error.port}`);
+    }
+    return parts.filter(Boolean).join(" ");
+  }
+
+  if (isRecord(value)) {
+    const parts: string[] = [];
+    if (typeof value.message === "string" && value.message.trim()) {
+      parts.push(value.message);
+    }
+    if (typeof value.code === "string" && value.code.trim()) {
+      parts.push(`code=${value.code}`);
+    }
+    if (
+      (typeof value.errno === "string" && value.errno.trim()) ||
+      typeof value.errno === "number"
+    ) {
+      parts.push(`errno=${value.errno}`);
+    }
+    if (typeof value.syscall === "string" && value.syscall.trim()) {
+      parts.push(`syscall=${value.syscall}`);
+    }
+    if (typeof value.hostname === "string" && value.hostname.trim()) {
+      parts.push(`host=${value.hostname}`);
+    }
+    if (typeof value.address === "string" && value.address.trim()) {
+      parts.push(`address=${value.address}`);
+    }
+    if (
+      (typeof value.port === "string" && value.port.trim()) ||
+      typeof value.port === "number"
+    ) {
+      parts.push(`port=${value.port}`);
+    }
+    if (parts.length > 0) {
+      return parts.join(" ");
+    }
+  }
+
+  return String(value);
+}
+
+function getErrorCause(value: unknown): unknown {
+  if (value instanceof Error) {
+    return (value as ErrorWithCause).cause;
+  }
+  if (isRecord(value) && "cause" in value) {
+    return value.cause;
+  }
+  return undefined;
+}
+
+function collectErrorCodes(value: unknown): string[] {
+  const seen = new Set<unknown>();
+  const codes = new Set<string>();
+  let current: unknown = value;
+  let depth = 0;
+
+  while (current && depth < ERROR_CAUSE_DEPTH_LIMIT && !seen.has(current)) {
+    seen.add(current);
+    if (isRecord(current) && typeof current.code === "string" && current.code.trim()) {
+      codes.add(current.code.toUpperCase());
+    }
+    current = getErrorCause(current);
+    depth += 1;
+  }
+
+  return [...codes];
+}
+
+function extractHttpStatusCode(error: Error): number | null {
+  const match = /^HTTP (\d{3}):/.exec(error.message);
+  if (!match) {
+    return null;
+  }
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+export function describeWechatTransportError(error: unknown): string {
+  const seen = new Set<unknown>();
+  const parts: string[] = [];
+  let current: unknown = error;
+  let depth = 0;
+
+  while (current && depth < ERROR_CAUSE_DEPTH_LIMIT && !seen.has(current)) {
+    seen.add(current);
+    const description = describeErrorNode(current);
+    if (description) {
+      parts.push(depth === 0 ? description : `cause: ${description}`);
+    }
+    current = getErrorCause(current);
+    depth += 1;
+  }
+
+  return parts.length > 0 ? parts.join(" | ") : String(error);
+}
+
+export function classifyWechatTransportError(
+  error: unknown,
+): WechatTransportErrorClassification {
+  if (error instanceof Error) {
+    if (error.name === "AbortError") {
+      return { kind: "timeout", retryable: true };
+    }
+
+    const statusCode = extractHttpStatusCode(error);
+    if (statusCode !== null) {
+      if (statusCode === 401 || statusCode === 403) {
+        return { kind: "auth", retryable: false, statusCode };
+      }
+      if (statusCode >= 500 || RETRYABLE_HTTP_STATUS_CODES.has(statusCode)) {
+        return { kind: "http", retryable: true, statusCode };
+      }
+      return { kind: "http", retryable: false, statusCode };
+    }
+  }
+
+  const errorCodes = collectErrorCodes(error);
+  if (errorCodes.some((code) => RETRYABLE_NETWORK_ERROR_CODES.has(code))) {
+    return { kind: "network", retryable: true };
+  }
+
+  const details = describeWechatTransportError(error).toLowerCase();
+  if (RETRYABLE_NETWORK_ERROR_HINTS.some((hint) => details.includes(hint))) {
+    return { kind: "network", retryable: true };
+  }
+
+  return { kind: "unknown", retryable: false };
 }
 
 function writeJsonFile(filePath: string, value: unknown): void {
