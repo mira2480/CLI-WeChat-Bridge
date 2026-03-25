@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import os from "node:os";
+import path from "node:path";
 
 import type { BridgeAdapterState, BridgeState } from "./bridge-types.ts";
 import {
@@ -17,6 +19,7 @@ import {
   MESSAGE_START_GRACE_MS,
   OutputBatcher,
   parseCodexSessionAgentMessage,
+  parseWechatFinalReply,
   parseSystemCommand,
   parseWechatControlCommand,
   shouldDropStartupBacklogMessage,
@@ -165,6 +168,172 @@ describe("parseCodexSessionAgentMessage", () => {
         }),
       ),
     ).toBeNull();
+  });
+});
+
+describe("WeChat attachment reply protocol", () => {
+  test("extracts trailing attachment blocks with multiple local paths", () => {
+    expect(
+      parseWechatFinalReply(
+        [
+          "Finished.",
+          "```wechat-attachments",
+          "image C:\\Users\\unlin\\Desktop\\photo 1.jpg",
+          "file C:\\Users\\unlin\\Desktop\\report final.pdf",
+          "video C:\\Users\\unlin\\Desktop\\clip.mp4",
+          "voice C:\\Users\\unlin\\Desktop\\audio.mp3",
+          "```",
+        ].join("\n"),
+      ),
+    ).toEqual({
+      visibleText: "Finished.",
+      attachments: [
+        {
+          kind: "image",
+          path: "C:\\Users\\unlin\\Desktop\\photo 1.jpg",
+        },
+        {
+          kind: "file",
+          path: "C:\\Users\\unlin\\Desktop\\report final.pdf",
+        },
+        {
+          kind: "video",
+          path: "C:\\Users\\unlin\\Desktop\\clip.mp4",
+        },
+        {
+          kind: "voice",
+          path: "C:\\Users\\unlin\\Desktop\\audio.mp3",
+        },
+      ],
+    });
+  });
+
+  test("rejects malformed attachment metadata and leaves the text unchanged", () => {
+    expect(
+      parseWechatFinalReply(
+        [
+          "Finished.",
+          "```wechat-attachments",
+          "image relative\\photo.jpg",
+          "```",
+        ].join("\n"),
+      ),
+    ).toEqual({
+      visibleText: ["Finished.", "```wechat-attachments", "image relative\\photo.jpg", "```"].join(
+        "\n",
+      ),
+      attachments: [],
+    });
+  });
+
+  test("extracts local files from wrapped maas image URLs when no attachment block is present", () => {
+    expect(
+      parseWechatFinalReply(
+        [
+          "Main campus wallpaper:",
+          "",
+          "https://maas-log-prod.cn-wlcb.ufileos.com/anthropic/abc/C:\\Users\\unlin\\Desktop\\albums\\",
+          "  campus\\main-building. png? UCloudPublicKey=TOKEN&Expires=1774447676&Signature=test",
+          "",
+          "Looks good.",
+        ].join("\n"),
+      ),
+    ).toEqual({
+      visibleText: "Main campus wallpaper:\n\nLooks good.",
+      attachments: [
+        {
+          kind: "image",
+          path: "C:\\Users\\unlin\\Desktop\\albums\\campus\\main-building.png",
+        },
+      ],
+    });
+  });
+
+  test("extracts inline code paths and keeps the surrounding narration", () => {
+    expect(
+      parseWechatFinalReply(
+        [
+          "Saved the render to `C:\\Users\\unlin\\Desktop\\exports\\cover.png`.",
+          "Please review it.",
+        ].join("\n"),
+      ),
+    ).toEqual({
+      visibleText: "Saved the render to .\nPlease review it.",
+      attachments: [
+        {
+          kind: "image",
+          path: "C:\\Users\\unlin\\Desktop\\exports\\cover.png",
+        },
+      ],
+    });
+  });
+
+  test("extracts standalone absolute paths from code fences", () => {
+    expect(
+      parseWechatFinalReply(
+        [
+          "Artifacts:",
+          "```text",
+          "C:\\Users\\unlin\\Desktop\\exports\\cover.png",
+          "C:\\Users\\unlin\\Desktop\\exports\\report.pdf",
+          "```",
+          "Done.",
+        ].join("\n"),
+      ),
+    ).toEqual({
+      visibleText: "Artifacts:\n\nDone.",
+      attachments: [
+        {
+          kind: "image",
+          path: "C:\\Users\\unlin\\Desktop\\exports\\cover.png",
+        },
+        {
+          kind: "file",
+          path: "C:\\Users\\unlin\\Desktop\\exports\\report.pdf",
+        },
+      ],
+    });
+  });
+
+  test("extracts home-relative desktop paths from ordinary text", () => {
+    expect(
+      parseWechatFinalReply(
+        [
+          "Pick this one:",
+          "Desktop/screenshots/air. png",
+          "If you want another, ask again.",
+        ].join("\n"),
+      ),
+    ).toEqual({
+      visibleText: "Pick this one:\n\nIf you want another, ask again.",
+      attachments: [
+        {
+          kind: "image",
+          path: path.join(os.homedir(), "Desktop", "screenshots", "air.png"),
+        },
+      ],
+    });
+  });
+
+  test("accepts home-relative desktop paths inside attachment blocks", () => {
+    expect(
+      parseWechatFinalReply(
+        [
+          "Ready.",
+          "```wechat-attachments",
+          "image Desktop/screenshots/air. png",
+          "```",
+        ].join("\n"),
+      ),
+    ).toEqual({
+      visibleText: "Ready.",
+      attachments: [
+        {
+          kind: "image",
+          path: path.join(os.homedir(), "Desktop", "screenshots", "air.png"),
+        },
+      ],
+    });
   });
 });
 
@@ -341,6 +510,7 @@ describe("adapter-aware message formatting", () => {
   });
 
   test("formats final reply and failure messages by adapter", () => {
+    expect(formatFinalReplyMessage("codex", "Done")).toBe("Done");
     expect(formatFinalReplyMessage("claude", "Done")).toBe("Done");
     expect(formatTaskFailedMessage("claude", "Boom")).toBe("Claude task failed:\nBoom");
   });

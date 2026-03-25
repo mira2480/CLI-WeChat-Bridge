@@ -13,9 +13,9 @@
     "wechat-bridge-shell": "./bin/wechat-bridge-shell.mjs"
   },
   "scripts": {
-    "setup": "bun src/wechat/setup.ts",
-    "start": "bun src/wechat/wechat-channel.ts",
-    "check": "bun src/wechat/wechat-channel.ts --check",
+    "setup": "node --no-warnings --experimental-strip-types src/wechat/setup.ts",
+    "start": "node --no-warnings --experimental-strip-types src/wechat/wechat-channel.ts",
+    "check": "node --no-warnings --experimental-strip-types src/wechat/wechat-channel.ts --check",
     "bridge": "node --no-warnings --experimental-strip-types src/bridge/wechat-bridge.ts",
     "bridge:codex": "node --no-warnings --experimental-strip-types src/bridge/wechat-bridge.ts --adapter codex",
     "codex:panel": "node --no-warnings --experimental-strip-types src/companion/local-companion.ts --adapter codex",
@@ -28,6 +28,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.80.0",
     "@modelcontextprotocol/sdk": "^1.27.1",
+    "ajv-formats": "^3.0.1",
     "node-pty": "^1.1.0",
     "qrcode-terminal": "^0.12.0"
   },

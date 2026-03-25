@@ -6,6 +6,7 @@ import {
   createBridgeAdapter,
   resolveDefaultAdapterCommand,
 } from "./bridge-adapters.ts";
+import { forwardWechatFinalReply } from "./bridge-final-reply.ts";
 import { migrateLegacyChannelFiles } from "../wechat/channel-config.ts";
 import { BridgeStateStore } from "./bridge-state.ts";
 import type {
@@ -18,7 +19,6 @@ import {
   formatApprovalMessage,
   formatPendingApprovalReminder,
   formatDuration,
-  formatFinalReplyMessage,
   formatMirroredUserInputMessage,
   formatSessionSwitchMessage,
   formatStatusReport,
@@ -162,18 +162,34 @@ async function main(): Promise<void> {
     initialResumeConversationId: stateStore.getState().resumeConversationId,
     initialTranscriptPath: stateStore.getState().transcriptPath,
   });
-  let sendChain = Promise.resolve();
+  let textSendChain = Promise.resolve();
+  let attachmentSendChain = Promise.resolve();
   let activeTask: ActiveTask | null = null;
   let lastOutputAt = 0;
   let lastHeartbeatAt = 0;
 
+  const queueWechatTextAction = <T>(action: () => Promise<T>) => {
+    const run = textSendChain.then(action);
+    textSendChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+
+  const queueWechatAttachmentAction = <T>(action: () => Promise<T>) => {
+    const run = attachmentSendChain.then(action);
+    attachmentSendChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+
   const queueWechatMessage = (senderId: string, text: string) => {
-    sendChain = sendChain
-      .then(() => transport.sendText(senderId, text))
-      .catch((err) => {
-        logError(`Failed to send WeChat reply: ${String(err)}`);
-      });
-    return sendChain;
+    return queueWechatTextAction(() => transport.sendText(senderId, text)).catch((err) => {
+      logError(`Failed to send WeChat reply: ${String(err)}`);
+    });
   };
 
   const outputBatcher = new OutputBatcher(async (text) => {
@@ -183,6 +199,12 @@ async function main(): Promise<void> {
   const cleanup = async () => {
     try {
       await outputBatcher.flushNow();
+    } catch {
+      // Best effort flush.
+    }
+    try {
+      await textSendChain;
+      await attachmentSendChain;
     } catch {
       // Best effort flush.
     }
@@ -208,8 +230,10 @@ async function main(): Promise<void> {
     wireAdapterEvents({
       adapter,
       options,
+      transport,
       stateStore,
       outputBatcher,
+      queueWechatAttachmentAction,
       queueWechatMessage,
       getActiveTask: () => activeTask,
       clearActiveTask: () => {
@@ -342,8 +366,10 @@ function syncSharedSessionState(
 function wireAdapterEvents(params: {
   adapter: BridgeAdapter;
   options: BridgeCliOptions;
+  transport: WeChatTransport;
   stateStore: BridgeStateStore;
   outputBatcher: OutputBatcher;
+  queueWechatAttachmentAction: <T>(action: () => Promise<T>) => Promise<T>;
   queueWechatMessage: (senderId: string, text: string) => Promise<void>;
   getActiveTask: () => ActiveTask | null;
   clearActiveTask: () => void;
@@ -353,8 +379,10 @@ function wireAdapterEvents(params: {
   const {
     adapter,
     options,
+    transport,
     stateStore,
     outputBatcher,
+    queueWechatAttachmentAction,
     queueWechatMessage,
     getActiveTask,
     clearActiveTask,
@@ -379,10 +407,29 @@ function wireAdapterEvents(params: {
         break;
       case "final_reply":
         void outputBatcher.flushNow().then(async () => {
-          await queueWechatMessage(
-            authorizedUserId,
-            formatFinalReplyMessage(options.adapter, event.text),
-          );
+          await forwardWechatFinalReply({
+            adapter: options.adapter,
+            rawText: event.text,
+            sender: {
+              sendText: (text) => queueWechatMessage(authorizedUserId, text),
+              sendImage: (imagePath) =>
+                queueWechatAttachmentAction(() =>
+                  transport.sendImage(imagePath, { recipientId: authorizedUserId }),
+                ),
+              sendFile: (filePath) =>
+                queueWechatAttachmentAction(() =>
+                  transport.sendFile(filePath, { recipientId: authorizedUserId }),
+                ),
+              sendVoice: (voicePath) =>
+                queueWechatAttachmentAction(() =>
+                  transport.sendVoice(voicePath, authorizedUserId),
+                ),
+              sendVideo: (videoPath) =>
+                queueWechatAttachmentAction(() =>
+                  transport.sendVideo(videoPath, { recipientId: authorizedUserId }),
+                ),
+            },
+          });
         });
         break;
       case "status":

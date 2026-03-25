@@ -1,3 +1,6 @@
+import os from "node:os";
+import path from "node:path";
+
 import type {
   ApprovalRequest,
   BridgeAdapterKind,
@@ -25,6 +28,51 @@ export type SystemCommand =
   | { type: "deny" };
 
 export const MESSAGE_START_GRACE_MS = 5_000;
+
+const WECHAT_ATTACHMENT_BLOCK_RE =
+  /\n```wechat-attachments[ \t]*\n([\s\S]*?)\n```[ \t]*$/;
+
+const WECHAT_ATTACHMENT_KINDS = ["image", "file", "video", "voice"] as const;
+const INLINE_IMAGE_EXTENSIONS = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".webp",
+  ".bmp",
+]);
+const INLINE_VIDEO_EXTENSIONS = new Set([
+  ".mp4",
+  ".mov",
+  ".mkv",
+  ".avi",
+  ".webm",
+]);
+const INLINE_VOICE_EXTENSIONS = new Set([
+  ".mp3",
+  ".wav",
+  ".m4a",
+  ".ogg",
+  ".aac",
+]);
+const INLINE_MAAS_URL_RE =
+  /https?:\/\/[^\s]*?\/([A-Za-z]:\\.+?\.[A-Za-z0-9]{2,5})(?:\?[^\n]*)?/g;
+const INLINE_WINDOWS_PATH_RE =
+  /(^|[^\w])`?([A-Za-z]:\\(?:[^\\/:*?"<>|\r\n`]+\\)*[^\\/:*?"<>|\r\n`]+?\.[A-Za-z0-9]{2,5})`?(?=$|[^\w])/gm;
+const INLINE_HOME_RELATIVE_PATH_RE =
+  /(^|[^\w])`?((?:~[\\/])?(?:Desktop|Documents|Downloads|Pictures|Videos|Music)[\\/](?:[^\\/:*?"<>|\r\n`]+[\\/])*[^\\/:*?"<>|\r\n`]+?\.\s*[A-Za-z0-9]{2,5})`?(?=$|[^\w])/gim;
+
+export type WechatAttachmentKind = (typeof WECHAT_ATTACHMENT_KINDS)[number];
+
+export type WechatReplyAttachment = {
+  kind: WechatAttachmentKind;
+  path: string;
+};
+
+export type ParsedWechatFinalReply = {
+  visibleText: string;
+  attachments: WechatReplyAttachment[];
+};
 
 type CodexSessionJsonLine = {
   timestamp?: string;
@@ -148,6 +196,55 @@ export function parseWechatControlCommand(
     default:
       return null;
   }
+}
+
+export function parseWechatFinalReply(text: string): ParsedWechatFinalReply {
+  const normalized = normalizeOutput(text);
+  const withLeadingNewline = normalized.startsWith("\n")
+    ? normalized
+    : `\n${normalized}`;
+  const match = withLeadingNewline.match(WECHAT_ATTACHMENT_BLOCK_RE);
+  if (!match) {
+    return extractInlineWechatAttachments(normalized);
+  }
+
+  const attachments: WechatReplyAttachment[] = [];
+  const lines = match[1]
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (!lines.length) {
+    return extractInlineWechatAttachments(normalized);
+  }
+
+  for (const line of lines) {
+    const parsed = /^(image|file|video|voice)\s+(.+)$/.exec(line);
+    if (!parsed) {
+      return extractInlineWechatAttachments(normalized);
+    }
+
+    const kind = parsed[1] as WechatAttachmentKind;
+    const attachmentPath = resolveWechatAttachmentPath(parsed[2]);
+    if (!attachmentPath) {
+      return extractInlineWechatAttachments(normalized);
+    }
+
+    attachments.push({
+      kind,
+      path: attachmentPath,
+    });
+  }
+
+  const blockIndex = withLeadingNewline.length - match[0].length;
+  const visibleText = withLeadingNewline.slice(0, blockIndex).trim();
+  const parsedFromBlock = {
+    visibleText,
+    attachments,
+  };
+  return parsedFromBlock.attachments.length > 0
+    ? parsedFromBlock
+    : extractInlineWechatAttachments(normalized);
 }
 
 export function parseCodexSessionAgentMessage(
@@ -448,11 +545,125 @@ export function formatFinalReplyMessage(
   adapter: BridgeAdapterKind,
   text: string,
 ): string {
-  if (adapter === "claude") {
+  if (adapter === "claude" || adapter === "codex") {
     return text;
   }
   const label = adapter === "codex" ? "Codex" : adapter === "claude" ? "Claude" : adapter;
   return `${label} final reply:\n${text}`;
+}
+
+function extractInlineWechatAttachments(text: string): ParsedWechatFinalReply {
+  const sanitized = text
+    .replace(/\\\n\s*/g, "\\")
+    .replace(/\.\s*\n?\s*([A-Za-z0-9]{2,5})(?=\?)/g, ".$1")
+    .replace(/\?\s+/g, "?");
+  const attachments: WechatReplyAttachment[] = [];
+  const seenPaths = new Set<string>();
+  let visibleText = sanitized;
+  const rememberAttachment = (candidatePath: string): boolean => {
+    const attachmentPath = resolveWechatAttachmentPath(candidatePath);
+    if (!attachmentPath) {
+      return false;
+    }
+
+    const kind = inferWechatAttachmentKind(attachmentPath);
+    if (!kind) {
+      return false;
+    }
+
+    if (!seenPaths.has(attachmentPath)) {
+      attachments.push({
+        kind,
+        path: attachmentPath,
+      });
+      seenPaths.add(attachmentPath);
+    }
+    return true;
+  };
+
+  visibleText = visibleText.replace(INLINE_MAAS_URL_RE, (fullMatch, candidatePath) => {
+    return rememberAttachment(candidatePath) ? "" : fullMatch;
+  });
+
+  visibleText = visibleText.replace(
+    INLINE_WINDOWS_PATH_RE,
+    (fullMatch, prefix, candidatePath) => {
+      return rememberAttachment(candidatePath) ? prefix : fullMatch;
+    },
+  );
+
+  visibleText = visibleText.replace(
+    INLINE_HOME_RELATIVE_PATH_RE,
+    (fullMatch, prefix, candidatePath) => {
+      return rememberAttachment(candidatePath) ? prefix : fullMatch;
+    },
+  );
+
+  return {
+    visibleText: cleanupVisibleWechatReplyText(visibleText),
+    attachments,
+  };
+}
+
+function resolveWechatAttachmentPath(candidatePath: string): string | null {
+  const normalizedCandidate = normalizeWechatAttachmentCandidate(candidatePath);
+  if (!normalizedCandidate) {
+    return null;
+  }
+
+  if (path.isAbsolute(normalizedCandidate)) {
+    return path.normalize(normalizedCandidate);
+  }
+
+  const homeRelativeMatch =
+    /^(?:~[\\/])?(Desktop|Documents|Downloads|Pictures|Videos|Music)([\\/].+)?$/i.exec(
+      normalizedCandidate,
+    );
+  if (!homeRelativeMatch) {
+    return null;
+  }
+
+  const relativeTail = `${homeRelativeMatch[1]}${homeRelativeMatch[2] ?? ""}`;
+  const relativeSegments = relativeTail.split(/[\\/]+/).filter(Boolean);
+  if (!relativeSegments.length) {
+    return null;
+  }
+
+  return path.normalize(path.join(os.homedir(), ...relativeSegments));
+}
+
+function normalizeWechatAttachmentCandidate(candidatePath: string): string {
+  return candidatePath
+    .trim()
+    .replace(/^`|`$/g, "")
+    .replace(/\.\s+([A-Za-z0-9]{2,5})(?=$|[?/\s])/g, ".$1")
+    .replace(/[\\/]+/g, path.sep);
+}
+
+function inferWechatAttachmentKind(filePath: string): WechatAttachmentKind | null {
+  const extension = path.extname(filePath).toLowerCase();
+  if (INLINE_IMAGE_EXTENSIONS.has(extension)) {
+    return "image";
+  }
+  if (INLINE_VIDEO_EXTENSIONS.has(extension)) {
+    return "video";
+  }
+  if (INLINE_VOICE_EXTENSIONS.has(extension)) {
+    return "voice";
+  }
+  if (extension) {
+    return "file";
+  }
+  return null;
+}
+
+function cleanupVisibleWechatReplyText(text: string): string {
+  return text
+    .replace(/```[^\n]*\n\s*```/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n[ \t]+\n/g, "\n\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 export function formatTaskFailedMessage(

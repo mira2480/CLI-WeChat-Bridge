@@ -741,7 +741,7 @@ export class CodexPtyAdapter extends AbstractPtyAdapter {
 
         if (finalText) {
           this.emit({
-            type: "stdout",
+            type: "final_reply",
             text: finalText,
             timestamp,
           });
@@ -2047,7 +2047,7 @@ export class CodexPtyAdapter extends AbstractPtyAdapter {
 
     if (finalText) {
       this.emit({
-        type: "stdout",
+        type: "final_reply",
         text: finalText,
         timestamp: nowIso(),
       });
@@ -2204,7 +2204,7 @@ export class CodexPtyAdapter extends AbstractPtyAdapter {
       this.setStatus("idle", "Recovered delayed Codex completion after final reply.");
     }
     this.emit({
-      type: "stdout",
+      type: "final_reply",
       text: finalText,
       timestamp: nowIso(),
     });

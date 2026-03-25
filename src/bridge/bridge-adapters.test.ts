@@ -1064,7 +1064,11 @@ describe("Codex panel completion recovery", () => {
     expect(adapter.state.status).toBe("idle");
     expect(adapter.state.activeTurnId).toBeUndefined();
     expect(adapter.state.activeTurnOrigin).toBeUndefined();
-    expect(events.map((event) => event.type)).toEqual(["status", "stdout", "task_complete"]);
+    expect(events.map((event) => event.type)).toEqual([
+      "status",
+      "final_reply",
+      "task_complete",
+    ]);
   });
 
   test("sendInput recovers a stale hidden active turn before starting the next WeChat turn", async () => {

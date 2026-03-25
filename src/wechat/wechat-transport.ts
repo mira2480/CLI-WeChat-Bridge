@@ -1,5 +1,7 @@
 import crypto from "node:crypto";
+import { createCipheriv } from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
 
 import {
   CONTEXT_CACHE_FILE,
@@ -10,15 +12,31 @@ import {
 } from "./channel-config.ts";
 
 export const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
-const MSG_TYPE_USER = 1;
-const MSG_TYPE_BOT = 2;
-const MSG_ITEM_TEXT = 1;
-const MSG_ITEM_VOICE = 3;
-const MSG_STATE_FINISH = 2;
+
+const CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
 const CHANNEL_VERSION = "0.3.0";
 const RECENT_MESSAGE_CACHE_SIZE = 500;
+const BYTES_PER_MB = 1024 * 1024;
+const SEND_TIMEOUT_MS = 15_000;
+const CDN_MAX_RETRIES = 3;
 
-type AccountData = {
+const MSG_TYPE_USER = 1;
+const MSG_TYPE_BOT = 2;
+
+const MSG_ITEM_TEXT = 1;
+const MSG_ITEM_IMAGE = 2;
+const MSG_ITEM_VOICE = 3;
+const MSG_ITEM_FILE = 4;
+const MSG_ITEM_VIDEO = 5;
+
+const MSG_STATE_FINISH = 2;
+
+const UPLOAD_MEDIA_TYPE_IMAGE = 1;
+const UPLOAD_MEDIA_TYPE_VIDEO = 2;
+const UPLOAD_MEDIA_TYPE_FILE = 3;
+const UPLOAD_MEDIA_TYPE_VOICE = 4;
+
+export type AccountData = {
   token: string;
   baseUrl: string;
   accountId: string;
@@ -87,6 +105,54 @@ type PollMessagesResult = {
 type TransportLogger = {
   log: (message: string) => void;
   logError: (message: string) => void;
+};
+
+type ResetSyncOptions = {
+  clearContextCache?: boolean;
+};
+
+type SendImageOptions = {
+  recipientId?: string;
+  caption?: string;
+};
+
+type SendFileOptions = {
+  recipientId?: string;
+  title?: string;
+};
+
+type SendVideoOptions = {
+  recipientId?: string;
+  title?: string;
+};
+
+type UploadLabel = "image" | "file" | "voice" | "video";
+
+type ResolvedRecipient = {
+  account: AccountData;
+  recipientId: string;
+  contextToken: string;
+};
+
+type UploadPreparation = {
+  rawsize: number;
+  filesize: number;
+  aeskey: Buffer;
+  downloadParam: string;
+};
+
+const DEFAULT_MEDIA_UPLOAD_LIMIT_MB: Record<UploadLabel, number> = {
+  image: 20,
+  file: 50,
+  voice: 20,
+  video: 100,
+};
+
+const MEDIA_UPLOAD_LIMIT_ENV_KEYS: Record<UploadLabel, string> = {
+  image: "WECHAT_MAX_IMAGE_MB",
+  file: "WECHAT_MAX_FILE_MB",
+  voice: "WECHAT_MAX_VOICE_MB",
+  video: "WECHAT_MAX_VIDEO_MB",
 };
 
 function readJsonFile<T>(filePath: string): T | null {
@@ -158,6 +224,152 @@ async function apiFetch(params: {
     clearTimeout(timer);
     throw err;
   }
+}
+
+function encryptAesEcb(plaintext: Buffer, key: Buffer): Buffer {
+  const cipher = createCipheriv("aes-128-ecb", key, null);
+  return Buffer.concat([cipher.update(plaintext), cipher.final()]);
+}
+
+function aesEcbPaddedSize(plaintextSize: number): number {
+  return Math.ceil((plaintextSize + 1) / 16) * 16;
+}
+
+export function formatByteSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    return "0 B";
+  }
+  if (bytes >= BYTES_PER_MB) {
+    const value = bytes / BYTES_PER_MB;
+    return `${value.toFixed(value >= 100 ? 0 : 1)} MB`;
+  }
+  if (bytes >= 1024) {
+    const value = bytes / 1024;
+    return `${value.toFixed(value >= 100 ? 0 : 1)} KB`;
+  }
+  return `${bytes} B`;
+}
+
+export function resolveMediaUploadLimitBytes(
+  label: UploadLabel,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const envKey = MEDIA_UPLOAD_LIMIT_ENV_KEYS[label];
+  const raw = env[envKey];
+  const fallbackMb = DEFAULT_MEDIA_UPLOAD_LIMIT_MB[label];
+  const parsedMb = raw ? Number(raw) : Number.NaN;
+  const limitMb =
+    Number.isFinite(parsedMb) && parsedMb > 0 ? parsedMb : fallbackMb;
+  return Math.floor(limitMb * BYTES_PER_MB);
+}
+
+export function assertMediaUploadSizeAllowed(
+  label: UploadLabel,
+  rawsize: number,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  const limitBytes = resolveMediaUploadLimitBytes(label, env);
+  if (rawsize <= limitBytes) {
+    return;
+  }
+
+  const envKey = MEDIA_UPLOAD_LIMIT_ENV_KEYS[label];
+  const labelName = label.charAt(0).toUpperCase() + label.slice(1);
+  throw new Error(
+    `${labelName} too large: ${formatByteSize(rawsize)} exceeds ${formatByteSize(limitBytes)} limit. Set ${envKey} to override.`,
+  );
+}
+
+function encodeMessageAesKey(aeskey: Buffer): string {
+  return Buffer.from(aeskey.toString("hex")).toString("base64");
+}
+
+async function getUploadUrl(
+  account: AccountData,
+  params: {
+    filekey: string;
+    media_type: number;
+    to_user_id: string;
+    rawsize: number;
+    rawfilemd5: string;
+    filesize: number;
+    aeskey: string;
+  },
+): Promise<{ upload_param?: string }> {
+  const raw = await apiFetch({
+    baseUrl: account.baseUrl,
+    endpoint: "ilink/bot/getuploadurl",
+    body: JSON.stringify({
+      ...params,
+      no_need_thumb: true,
+      base_info: { channel_version: CHANNEL_VERSION },
+    }),
+    token: account.token,
+    timeoutMs: SEND_TIMEOUT_MS,
+  });
+  return JSON.parse(raw) as { upload_param?: string };
+}
+
+function buildCdnUploadUrl(
+  cdnBaseUrl: string,
+  uploadParam: string,
+  filekey: string,
+): string {
+  return `${cdnBaseUrl}/upload?encrypted_query_param=${encodeURIComponent(uploadParam)}&filekey=${encodeURIComponent(filekey)}`;
+}
+
+async function uploadBufferToCdn(params: {
+  buf: Buffer;
+  uploadParam: string;
+  filekey: string;
+  aeskey: Buffer;
+  onRetry?: (attempt: number) => void;
+}): Promise<{ downloadParam: string }> {
+  const ciphertext = encryptAesEcb(params.buf, params.aeskey);
+  const cdnUrl = buildCdnUploadUrl(CDN_BASE_URL, params.uploadParam, params.filekey);
+
+  let downloadParam: string | undefined;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= CDN_MAX_RETRIES; attempt += 1) {
+    try {
+      const res = await fetch(cdnUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: new Uint8Array(ciphertext),
+      });
+
+      if (res.status >= 400 && res.status < 500) {
+        const errMsg = res.headers.get("x-error-message") ?? (await res.text());
+        throw new Error(`CDN client error ${res.status}: ${errMsg}`);
+      }
+      if (res.status !== 200) {
+        const errMsg = res.headers.get("x-error-message") ?? `status ${res.status}`;
+        throw new Error(`CDN server error: ${errMsg}`);
+      }
+
+      downloadParam = res.headers.get("x-encrypted-param") ?? undefined;
+      if (!downloadParam) {
+        throw new Error("CDN response missing x-encrypted-param header");
+      }
+      break;
+    } catch (err) {
+      lastError = err;
+      if (err instanceof Error && err.message.includes("client error")) {
+        throw err;
+      }
+      if (attempt >= CDN_MAX_RETRIES) {
+        break;
+      }
+      params.onRetry?.(attempt);
+    }
+  }
+
+  if (!downloadParam) {
+    throw lastError instanceof Error ? lastError : new Error("CDN upload failed");
+  }
+
+  return { downloadParam };
 }
 
 function extractReferenceLabel(item: MessageItem): string | null {
@@ -247,16 +459,47 @@ export class WeChatTransport {
     return readJsonFile<AccountData>(CREDENTIALS_FILE);
   }
 
+  getStatusText(): string {
+    const account = this.getCredentials();
+    const syncExists = fs.existsSync(SYNC_BUF_FILE);
+    const contextExists = fs.existsSync(CONTEXT_CACHE_FILE);
+
+    return [
+      `credentials_file: ${CREDENTIALS_FILE}`,
+      `credentials_present: ${account ? "yes" : "no"}`,
+      `sync_state_file: ${SYNC_BUF_FILE}`,
+      `sync_state_present: ${syncExists ? "yes" : "no"}`,
+      `context_cache_file: ${CONTEXT_CACHE_FILE}`,
+      `context_cache_present: ${contextExists ? "yes" : "no"}`,
+      `cached_context_count: ${this.contextTokenCache.size}`,
+      `max_image_mb: ${resolveMediaUploadLimitBytes("image") / BYTES_PER_MB}`,
+      `max_file_mb: ${resolveMediaUploadLimitBytes("file") / BYTES_PER_MB}`,
+      `max_voice_mb: ${resolveMediaUploadLimitBytes("voice") / BYTES_PER_MB}`,
+      `max_video_mb: ${resolveMediaUploadLimitBytes("video") / BYTES_PER_MB}`,
+      `account_id: ${account?.accountId ?? "(none)"}`,
+      `user_id: ${account?.userId ?? "(none)"}`,
+      `saved_at: ${account?.savedAt ?? "(none)"}`,
+    ].join("\n");
+  }
+
+  resetSyncState(options: ResetSyncOptions = {}): string {
+    this.clearSyncBuffer();
+    this.clearRecentMessages();
+
+    if (options.clearContextCache) {
+      this.clearContextTokenCache();
+    }
+
+    return options.clearContextCache
+      ? "Reset sync state and cleared cached context tokens."
+      : "Reset sync state.";
+  }
+
   async pollMessages(
     options: PollMessagesOptions = {},
   ): Promise<PollMessagesResult> {
     const timeoutMs = options.timeoutMs ?? DEFAULT_LONG_POLL_TIMEOUT_MS;
-    const account = this.getCredentials();
-    if (!account) {
-      throw new Error(
-        `No saved WeChat credentials found. Run "bun run setup" first. Expected file: ${CREDENTIALS_FILE}`,
-      );
-    }
+    const account = this.requireAccount();
 
     const response = await this.getUpdates(account, timeoutMs);
     const isError =
@@ -276,6 +519,7 @@ export class WeChatTransport {
 
     const messages: InboundWechatMessage[] = [];
     let ignoredBacklogCount = 0;
+
     for (const rawMessage of response.msgs ?? []) {
       if (rawMessage.message_type !== MSG_TYPE_USER) {
         continue;
@@ -320,41 +564,315 @@ export class WeChatTransport {
   }
 
   async sendText(senderId: string, text: string): Promise<void> {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    const resolved = this.resolveRecipient(senderId);
+    await this.sendTextWithContextToken(
+      resolved.account,
+      resolved.recipientId,
+      trimmed,
+      resolved.contextToken,
+    );
+  }
+
+  async sendNotification(message: string, recipientId?: string): Promise<string> {
+    const trimmed = message.trim();
+    if (!trimmed) {
+      throw new Error("Notification text cannot be empty.");
+    }
+
+    const resolved = this.resolveRecipient(recipientId);
+    await this.sendTextWithContextToken(
+      resolved.account,
+      resolved.recipientId,
+      trimmed,
+      resolved.contextToken,
+    );
+    return resolved.recipientId;
+  }
+
+  async sendImage(imagePath: string, options: SendImageOptions = {}): Promise<string> {
+    const resolved = this.resolveRecipient(options.recipientId);
+    const caption = options.caption?.trim();
+
+    if (caption) {
+      await this.sendTextWithContextToken(
+        resolved.account,
+        resolved.recipientId,
+        caption,
+        resolved.contextToken,
+      );
+    }
+
+    const upload = await this.prepareUpload(
+      resolved.account,
+      resolved.recipientId,
+      imagePath,
+      UPLOAD_MEDIA_TYPE_IMAGE,
+      "image",
+    );
+
+    await this.sendMessage(resolved.account, resolved.recipientId, resolved.contextToken, [
+      {
+        type: MSG_ITEM_IMAGE,
+        image_item: {
+          media: {
+            encrypt_query_param: upload.downloadParam,
+            aes_key: encodeMessageAesKey(upload.aeskey),
+            encrypt_type: 1,
+          },
+          mid_size: upload.filesize,
+        },
+      },
+    ]);
+
+    return resolved.recipientId;
+  }
+
+  async sendFile(filePath: string, options: SendFileOptions = {}): Promise<string> {
+    const resolved = this.resolveRecipient(options.recipientId);
+    const upload = await this.prepareUpload(
+      resolved.account,
+      resolved.recipientId,
+      filePath,
+      UPLOAD_MEDIA_TYPE_FILE,
+      "file",
+    );
+    const fileName = options.title?.trim() || path.basename(filePath);
+
+    await this.sendMessage(resolved.account, resolved.recipientId, resolved.contextToken, [
+      {
+        type: MSG_ITEM_FILE,
+        file_item: {
+          file_name: fileName,
+          len: String(upload.rawsize),
+          media: {
+            encrypt_query_param: upload.downloadParam,
+            aes_key: encodeMessageAesKey(upload.aeskey),
+            encrypt_type: 1,
+          },
+        },
+      },
+    ]);
+
+    return resolved.recipientId;
+  }
+
+  async sendVoice(voicePath: string, recipientId?: string): Promise<string> {
+    const resolved = this.resolveRecipient(recipientId);
+    const upload = await this.prepareUpload(
+      resolved.account,
+      resolved.recipientId,
+      voicePath,
+      UPLOAD_MEDIA_TYPE_VOICE,
+      "voice",
+    );
+
+    await this.sendMessage(resolved.account, resolved.recipientId, resolved.contextToken, [
+      {
+        type: MSG_ITEM_VOICE,
+        voice_item: {
+          media: {
+            encrypt_query_param: upload.downloadParam,
+            aes_key: encodeMessageAesKey(upload.aeskey),
+            encrypt_type: 1,
+          },
+        },
+      },
+    ]);
+
+    return resolved.recipientId;
+  }
+
+  async sendVideo(videoPath: string, options: SendVideoOptions = {}): Promise<string> {
+    const resolved = this.resolveRecipient(options.recipientId);
+    const title = options.title?.trim();
+
+    if (title) {
+      await this.sendTextWithContextToken(
+        resolved.account,
+        resolved.recipientId,
+        title,
+        resolved.contextToken,
+      );
+    }
+
+    const upload = await this.prepareUpload(
+      resolved.account,
+      resolved.recipientId,
+      videoPath,
+      UPLOAD_MEDIA_TYPE_VIDEO,
+      "video",
+    );
+
+    await this.sendMessage(resolved.account, resolved.recipientId, resolved.contextToken, [
+      {
+        type: MSG_ITEM_VIDEO,
+        video_item: {
+          media: {
+            encrypt_query_param: upload.downloadParam,
+            aes_key: encodeMessageAesKey(upload.aeskey),
+            encrypt_type: 1,
+          },
+          video_size: upload.filesize,
+        },
+      },
+    ]);
+
+    return resolved.recipientId;
+  }
+
+  private requireAccount(): AccountData {
     const account = this.getCredentials();
     if (!account) {
       throw new Error(
         `No saved WeChat credentials found. Run "bun run setup" first. Expected file: ${CREDENTIALS_FILE}`,
       );
     }
+    return account;
+  }
 
-    const contextToken = this.contextTokenCache.get(senderId);
-    if (!contextToken) {
-      throw new Error(`No cached context token for ${senderId}.`);
+  private resolveRecipient(recipientId?: string): ResolvedRecipient {
+    const account = this.requireAccount();
+
+    let resolvedRecipientId = recipientId?.trim();
+    if (!resolvedRecipientId) {
+      const recipients = [...this.contextTokenCache.keys()];
+      resolvedRecipientId = recipients[recipients.length - 1];
+      if (!resolvedRecipientId) {
+        throw new Error(
+          "No cached context token is available. Fetch messages first or ask the user to send a new WeChat message.",
+        );
+      }
     }
 
+    const contextToken = this.contextTokenCache.get(resolvedRecipientId);
+    if (!contextToken) {
+      throw new Error(
+        `No cached context token for ${resolvedRecipientId}. Fetch messages first or ask the user to send a new WeChat message.`,
+      );
+    }
+
+    return { account, recipientId: resolvedRecipientId, contextToken };
+  }
+
+  private async sendTextWithContextToken(
+    account: AccountData,
+    recipientId: string,
+    text: string,
+    contextToken: string,
+  ): Promise<void> {
     const trimmed = text.trim();
     if (!trimmed) {
       return;
     }
 
+    await this.sendMessage(account, recipientId, contextToken, [
+      { type: MSG_ITEM_TEXT, text_item: { text: trimmed } },
+    ]);
+  }
+
+  private async sendMessage(
+    account: AccountData,
+    recipientId: string,
+    contextToken: string,
+    itemList: unknown[],
+  ): Promise<void> {
     await apiFetch({
       baseUrl: account.baseUrl,
       endpoint: "ilink/bot/sendmessage",
       body: JSON.stringify({
         msg: {
           from_user_id: "",
-          to_user_id: senderId,
+          to_user_id: recipientId,
           client_id: this.generateClientId(),
           message_type: MSG_TYPE_BOT,
           message_state: MSG_STATE_FINISH,
-          item_list: [{ type: MSG_ITEM_TEXT, text_item: { text: trimmed } }],
+          item_list: itemList,
           context_token: contextToken,
         },
         base_info: { channel_version: CHANNEL_VERSION },
       }),
       token: account.token,
-      timeoutMs: 15_000,
+      timeoutMs: SEND_TIMEOUT_MS,
     });
+  }
+
+  private async prepareUpload(
+    account: AccountData,
+    recipientId: string,
+    filePath: string,
+    mediaType: number,
+    label: UploadLabel,
+  ): Promise<UploadPreparation> {
+    const stat = this.requireExistingFile(filePath);
+    assertMediaUploadSizeAllowed(label, stat.size);
+
+    const plaintext = fs.readFileSync(filePath);
+    const rawsize = plaintext.length;
+    const rawfilemd5 = crypto.createHash("md5").update(plaintext).digest("hex");
+    const filesize = aesEcbPaddedSize(rawsize);
+    const filekey = crypto.randomBytes(16).toString("hex");
+    const aeskey = crypto.randomBytes(16);
+
+    this.logger.log(
+      `Uploading ${label}: ${filePath} (${rawsize} bytes, md5=${rawfilemd5})`,
+    );
+
+    const uploadResp = await getUploadUrl(account, {
+      filekey,
+      media_type: mediaType,
+      to_user_id: recipientId,
+      rawsize,
+      rawfilemd5,
+      filesize,
+      aeskey: aeskey.toString("hex"),
+    });
+
+    if (!uploadResp.upload_param) {
+      throw new Error("getUploadUrl returned no upload_param");
+    }
+
+    const { downloadParam } = await uploadBufferToCdn({
+      buf: plaintext,
+      uploadParam: uploadResp.upload_param,
+      filekey,
+      aeskey,
+      onRetry: (attempt) => {
+        this.logger.log(
+          `CDN upload attempt ${attempt} failed for ${label}, retrying...`,
+        );
+      },
+    });
+
+    this.logger.log(
+      `${label} upload complete, downloadParam length=${downloadParam.length}`,
+    );
+
+    return {
+      rawsize,
+      filesize,
+      aeskey,
+      downloadParam,
+    };
+  }
+
+  private requireExistingFile(filePath: string): fs.Stats {
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(filePath);
+    } catch {
+      throw new Error(`File not found: ${filePath}`);
+    }
+
+    if (!stat.isFile()) {
+      throw new Error(`Not a file: ${filePath}`);
+    }
+
+    return stat;
   }
 
   private async getUpdates(
@@ -400,6 +918,11 @@ export class WeChatTransport {
     return true;
   }
 
+  private clearRecentMessages(): void {
+    this.recentMessageKeys.clear();
+    this.recentMessageOrder.length = 0;
+  }
+
   private readSyncBuffer(): string {
     try {
       if (!fs.existsSync(SYNC_BUF_FILE)) {
@@ -417,14 +940,26 @@ export class WeChatTransport {
     fs.writeFileSync(SYNC_BUF_FILE, syncBuffer, "utf-8");
   }
 
-  private cacheContextToken(senderId: string, token: string): void {
-    const existing = this.contextTokenCache.get(senderId);
-    if (existing === token) {
-      return;
+  private clearSyncBuffer(): void {
+    this.syncBuffer = "";
+    if (fs.existsSync(SYNC_BUF_FILE)) {
+      fs.rmSync(SYNC_BUF_FILE, { force: true });
     }
+  }
 
+  private cacheContextToken(senderId: string, token: string): void {
+    if (this.contextTokenCache.has(senderId)) {
+      this.contextTokenCache.delete(senderId);
+    }
     this.contextTokenCache.set(senderId, token);
     writeJsonFile(CONTEXT_CACHE_FILE, Object.fromEntries(this.contextTokenCache));
+  }
+
+  private clearContextTokenCache(): void {
+    this.contextTokenCache.clear();
+    if (fs.existsSync(CONTEXT_CACHE_FILE)) {
+      fs.rmSync(CONTEXT_CACHE_FILE, { force: true });
+    }
   }
 
   private generateClientId(): string {
