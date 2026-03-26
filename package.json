@@ -1,16 +1,28 @@
 {
-  "name": "cli-wechat-bridge",
+  "name": "@unlinearity/cli-wechat-bridge",
   "version": "0.1.0",
   "description": "CLI WeChat Bridge for Codex, Claude Code, and PowerShell over WeChat",
   "type": "module",
   "private": true,
+  "keywords": ["wechat", "cli", "bridge", "codex", "claude", "terminal"],
+  "author": "UNLINEARITY",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/UNLINEARITY/CLI-WeChat-Bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/UNLINEARITY/CLI-WeChat-Bridge/issues"
+  },
+  "homepage": "https://github.com/UNLINEARITY/CLI-WeChat-Bridge#readme",
   "bin": {
     "wechat-bridge": "./bin/wechat-bridge.mjs",
     "wechat-bridge-codex": "./bin/wechat-bridge-codex.mjs",
     "wechat-codex": "./bin/wechat-codex.mjs",
     "wechat-claude": "./bin/wechat-claude.mjs",
     "wechat-bridge-claude": "./bin/wechat-bridge-claude.mjs",
-    "wechat-bridge-shell": "./bin/wechat-bridge-shell.mjs"
+    "wechat-bridge-shell": "./bin/wechat-bridge-shell.mjs",
+    "wechat-check-update": "./bin/wechat-check-update.mjs"
   },
   "scripts": {
     "setup": "node --no-warnings --experimental-strip-types src/wechat/setup.ts",

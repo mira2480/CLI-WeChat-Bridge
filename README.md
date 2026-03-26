@@ -52,6 +52,11 @@ bun install
 npm install -g .
 ```
 
+如果仓库更新，而本地留有旧配置，可以重新clone，再强制更新：
+```bash
+npm install -g . --force
+```
+
 开发阶段也可以使用：
 
 ```bash
@@ -251,6 +256,61 @@ wechat-bridge-shell --cmd pwsh.exe
 | --- | --- |
 | `WECHAT_ILINK_BASE_URL` | 覆盖默认 iLink API 地址 |
 | `CLAUDE_WECHAT_CHANNEL_DATA_DIR` | 覆盖默认数据目录 |
+
+## 版本更新
+
+### 检查更新
+
+运行以下命令检查是否有新版本：
+
+```bash
+wechat-check-update
+```
+
+该命令会显示：
+- 当前安装的版本
+- 远程仓库的最新版本
+- 如果有更新，会提供详细的更新指引
+
+### 启动时自动检查
+
+当启动 `wechat-bridge` 相关命令时（如 `wechat-bridge-codex`、`wechat-bridge-claude`），程序会自动检查更新（每24小时一次）。
+
+- 自动检查在后台异步执行，不影响启动速度
+- 检查结果会被缓存，避免频繁查询
+- 如果发现新版本，会在终端显示更新提示
+
+### 版本检查机制
+
+- **查询方式**：使用 `git ls-remote --tags origin` 查询远程仓库版本标签
+- **缓存策略**：检查结果缓存在 `~/.claude/channels/wechat/update-check.json`，有效期24小时
+- **无 API 限制**：不使用 GitHub API，避免限流问题，可以频繁使用
+
+### 获取最新版本
+
+当提示有新版本时，使用以下命令更新：
+
+```bash
+# 进入项目目录
+cd CLI-WeChat-Bridge
+
+# 拉取最新代码
+git pull
+
+# 安装依赖
+bun install
+
+# 重新安装全局命令
+npm install -g .
+```
+
+### 未来计划（还未发布）
+
+当项目达到 **1.0.0** 稳定版本后，将发布到 npm，届时可以使用更简便的更新方式：
+
+```bash
+npm install -g @unlinearity/cli-wechat-bridge@latest
+```
 
 ## 常见问题
 

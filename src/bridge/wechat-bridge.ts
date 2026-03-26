@@ -37,6 +37,10 @@ import {
   describeWechatTransportError,
   type InboundWechatMessage,
 } from "../wechat/wechat-transport.ts";
+import {
+  checkForUpdate,
+  formatUpdateMessage,
+} from "../utils/version-checker.ts";
 
 type BridgeCliOptions = {
   adapter: BridgeAdapterKind;
@@ -147,6 +151,18 @@ function printUsageAndExit(): never {
 
 async function main(): Promise<void> {
   migrateLegacyChannelFiles(log);
+
+  // 非阻塞地检查更新（不影响启动速度）
+  setTimeout(async () => {
+    try {
+      const versionInfo = await checkForUpdate();
+      if (versionInfo?.hasUpdate) {
+        log(formatUpdateMessage(versionInfo));
+      }
+    } catch (error) {
+      // 静默失败，不影响正常使用
+    }
+  }, 3000); // 延迟3秒，确保不影响启动
 
   const options = parseCliArgs(process.argv.slice(2));
   const transport = new WeChatTransport({ log, logError });
