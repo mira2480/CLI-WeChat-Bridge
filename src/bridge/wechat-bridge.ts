@@ -17,6 +17,7 @@ import type {
   PendingApproval,
 } from "./bridge-types.ts";
 import {
+  buildWechatInboundPrompt,
   buildOneTimeCode,
   formatApprovalMessage,
   formatPendingApprovalReminder,
@@ -905,7 +906,7 @@ async function handleInboundMessage(params: {
     inputPreview: truncatePreview(message.text, 180),
   };
   stateStore.appendLog(`Forwarded input to ${options.adapter}: ${truncatePreview(message.text)}`);
-  await adapter.sendInput(message.text);
+  await adapter.sendInput(buildWechatInboundPrompt(message.text));
   return activeTask;
 }
 

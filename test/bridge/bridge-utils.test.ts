@@ -7,7 +7,9 @@ import type {
   BridgeState,
 } from "../../src/bridge/bridge-types.ts";
 import {
+  buildWechatInboundPrompt,
   buildOneTimeCode,
+  shouldInjectWechatAttachmentPrompt,
   detectCliApproval,
   formatApprovalMessage,
   formatFinalReplyMessage,
@@ -169,6 +171,36 @@ describe("detectCliApproval", () => {
   });
 });
 
+describe("wechat inbound prompt injection", () => {
+  test("injects attachment guidance for explicit send-to-WeChat requests", () => {
+    const prompt = buildWechatInboundPrompt("把桌面的pdf发给我，发送微信");
+
+    expect(shouldInjectWechatAttachmentPrompt("把桌面的pdf发给我，发送微信")).toBe(true);
+    expect(prompt).toContain("[WeChat bridge note]");
+    expect(prompt).toContain("```wechat-attachments");
+    expect(prompt).toContain("[User request]\n把桌面的pdf发给我，发送微信");
+  });
+
+  test("injects attachment guidance for short follow-up send commands", () => {
+    expect(shouldInjectWechatAttachmentPrompt("发送微信")).toBe(true);
+    expect(buildWechatInboundPrompt("直接发给我")).toContain("```wechat-attachments");
+  });
+
+  test("skips prompt injection for ordinary non-send requests and existing protocol blocks", () => {
+    const ordinary = "帮我总结一下这份强化学习资料。";
+    const explicitProtocol = [
+      "直接发送。",
+      "```wechat-attachments",
+      "file C:\\Users\\unlin\\Desktop\\rl.pdf",
+      "```",
+    ].join("\n");
+
+    expect(shouldInjectWechatAttachmentPrompt(ordinary)).toBe(false);
+    expect(buildWechatInboundPrompt(ordinary)).toBe(ordinary);
+    expect(buildWechatInboundPrompt(explicitProtocol)).toBe(explicitProtocol);
+  });
+});
+
 describe("parseCodexSessionAgentMessage", () => {
   test("extracts final-answer agent messages from the Codex session log", () => {
     expect(
@@ -300,6 +332,47 @@ describe("WeChat attachment reply protocol", () => {
     });
   });
 
+  test("keeps multi-dot document names intact when extracting inline attachments", () => {
+    expect(
+      parseWechatFinalReply(
+        [
+          "Artifacts:",
+          "```text",
+          "C:\\Users\\unlin\\Desktop\\exports\\analysis.final.pdf",
+          "```",
+          "Done.",
+        ].join("\n"),
+      ),
+    ).toEqual({
+      visibleText: "Artifacts:\n\nDone.",
+      attachments: [
+        {
+          kind: "file",
+          path: "C:\\Users\\unlin\\Desktop\\exports\\analysis.final.pdf",
+        },
+      ],
+    });
+  });
+
+  test("extracts ordinary local text files from inline paths", () => {
+    expect(
+      parseWechatFinalReply(
+        [
+          "Saved note to `C:\\Users\\unlin\\Desktop\\exports\\summary.txt`.",
+          "Review it.",
+        ].join("\n"),
+      ),
+    ).toEqual({
+      visibleText: "Saved note to .\nReview it.",
+      attachments: [
+        {
+          kind: "file",
+          path: "C:\\Users\\unlin\\Desktop\\exports\\summary.txt",
+        },
+      ],
+    });
+  });
+
   test("extracts standalone absolute paths from code fences", () => {
     expect(
       parseWechatFinalReply(
@@ -327,6 +400,25 @@ describe("WeChat attachment reply protocol", () => {
     });
   });
 
+  test("does not auto-attach source code paths from ordinary text", () => {
+    expect(
+      parseWechatFinalReply(
+        [
+          "Reference only:",
+          "`C:\\Users\\unlin\\Desktop\\Github\\claude-code-wechat-channel\\src\\bridge\\bridge-adapters.test.ts`",
+          "Do not upload this file.",
+        ].join("\n"),
+      ),
+    ).toEqual({
+      visibleText: [
+        "Reference only:",
+        "`C:\\Users\\unlin\\Desktop\\Github\\claude-code-wechat-channel\\src\\bridge\\bridge-adapters.test.ts`",
+        "Do not upload this file.",
+      ].join("\n"),
+      attachments: [],
+    });
+  });
+
   test("extracts home-relative desktop paths from ordinary text", () => {
     expect(
       parseWechatFinalReply(
@@ -342,6 +434,27 @@ describe("WeChat attachment reply protocol", () => {
         {
           kind: "image",
           path: path.join(os.homedir(), "Desktop", "screenshots", "air.png"),
+        },
+      ],
+    });
+  });
+
+  test("keeps explicit attachment blocks authoritative for arbitrary file types", () => {
+    expect(
+      parseWechatFinalReply(
+        [
+          "Ready.",
+          "```wechat-attachments",
+          "file C:\\Users\\unlin\\Desktop\\Github\\claude-code-wechat-channel\\src\\bridge\\bridge-adapters.test.ts",
+          "```",
+        ].join("\n"),
+      ),
+    ).toEqual({
+      visibleText: "Ready.",
+      attachments: [
+        {
+          kind: "file",
+          path: "C:\\Users\\unlin\\Desktop\\Github\\claude-code-wechat-channel\\src\\bridge\\bridge-adapters.test.ts",
         },
       ],
     });

@@ -28,6 +28,32 @@ export type SystemCommand =
   | { type: "deny" };
 
 export const MESSAGE_START_GRACE_MS = 5_000;
+const WECHAT_ATTACHMENT_SEND_INTENT_RE =
+  /\b(send|upload|attach|forward|share)\b/i;
+const WECHAT_ATTACHMENT_SEND_INTENT_ZH_RE =
+  /发送|发给我|发我|发到|上传|转发|分享/;
+const WECHAT_ATTACHMENT_TARGET_RE = /\bwechat\b/i;
+const WECHAT_ATTACHMENT_TARGET_ZH_RE = /微信/;
+const WECHAT_ATTACHMENT_FILE_TERM_RE =
+  /\b(file|attachment|pdf|document|docx?|xlsx?|pptx?|csv|txt|zip|rar|7z|image|photo|picture|screenshot|audio|voice|video|png|jpe?g|gif|webp|bmp|mp3|wav|m4a|ogg|aac|mov|mp4|mkv|avi)\b/i;
+const WECHAT_ATTACHMENT_FILE_TERM_ZH_RE =
+  /文件|附件|文档|压缩包|图片|照片|截图|音频|语音|视频|pdf|PDF/;
+const LOCAL_ATTACHMENT_PATH_HINT_RE =
+  /(?:[A-Za-z]:\\|(?:~[\\/])?(?:Desktop|Documents|Downloads|Pictures|Videos|Music)[\\/])/i;
+const WECHAT_ATTACHMENT_PROMPT_PREFIX = [
+  "[WeChat bridge note]",
+  "Your final reply will be forwarded back to a WeChat chat.",
+  "If the user asks you to send a local file or media to WeChat and you know the local path, do not say that you lack a WeChat sending tool.",
+  "For a real send request, prefer locating and sending the file directly instead of opening or reading it unless the user explicitly asked for that.",
+  "Put any brief visible reply text first, then end the message with exactly one trailing block like:",
+  "```wechat-attachments",
+  "file C:\\Users\\name\\Desktop\\document.pdf",
+  "```",
+  "Valid kinds: image, file, video, voice.",
+  "Use `file` for PDFs and ordinary documents. Only include files you truly intend to upload.",
+  "",
+  "[User request]",
+].join("\n");
 
 const WECHAT_ATTACHMENT_BLOCK_RE =
   /\n```wechat-attachments[ \t]*\n([\s\S]*?)\n```[ \t]*$/;
@@ -55,12 +81,52 @@ const INLINE_VOICE_EXTENSIONS = new Set([
   ".ogg",
   ".aac",
 ]);
+const INLINE_REFERENCE_ONLY_FILE_EXTENSIONS = new Set([
+  ".bat",
+  ".c",
+  ".cc",
+  ".cjs",
+  ".cmd",
+  ".cpp",
+  ".cs",
+  ".cts",
+  ".cxx",
+  ".go",
+  ".h",
+  ".hh",
+  ".hpp",
+  ".java",
+  ".js",
+  ".jsx",
+  ".kt",
+  ".kts",
+  ".lua",
+  ".m",
+  ".mjs",
+  ".mm",
+  ".mts",
+  ".php",
+  ".pl",
+  ".ps1",
+  ".psd1",
+  ".psm1",
+  ".py",
+  ".rb",
+  ".rs",
+  ".scala",
+  ".sh",
+  ".swift",
+  ".ts",
+  ".tsx",
+  ".vb",
+  ".zsh",
+]);
 const INLINE_MAAS_URL_RE =
-  /https?:\/\/[^\s]*?\/([A-Za-z]:\\.+?\.[A-Za-z0-9]{2,5})(?:\?[^\n]*)?/g;
+  /https?:\/\/[^\s]*?\/([A-Za-z]:\\.+?(?:\.\s*[A-Za-z0-9]{2,8})+)(?:\?[^\n]*)?/g;
 const INLINE_WINDOWS_PATH_RE =
-  /(^|[^\w])`?([A-Za-z]:\\(?:[^\\/:*?"<>|\r\n`]+\\)*[^\\/:*?"<>|\r\n`]+?\.[A-Za-z0-9]{2,5})`?(?=$|[^\w])/gm;
+  /(^|[^\w])`?([A-Za-z]:\\(?:[^\\/:*?"<>|\r\n`]+\\)*[^\\/:*?"<>|\r\n`]+?(?:\.\s*[A-Za-z0-9]{2,8})+)`?(?=$|[^\w])/gm;
 const INLINE_HOME_RELATIVE_PATH_RE =
-  /(^|[^\w])`?((?:~[\\/])?(?:Desktop|Documents|Downloads|Pictures|Videos|Music)[\\/](?:[^\\/:*?"<>|\r\n`]+[\\/])*[^\\/:*?"<>|\r\n`]+?\.\s*[A-Za-z0-9]{2,5})`?(?=$|[^\w])/gim;
+  /(^|[^\w])`?((?:~[\\/])?(?:Desktop|Documents|Downloads|Pictures|Videos|Music)[\\/](?:[^\\/:*?"<>|\r\n`]+[\\/])*[^\\/:*?"<>|\r\n`]+?(?:\.\s*[A-Za-z0-9]{2,8})+)`?(?=$|[^\w])/gim;
 
 export type WechatAttachmentKind = (typeof WECHAT_ATTACHMENT_KINDS)[number];
 
@@ -196,6 +262,49 @@ export function parseWechatControlCommand(
     default:
       return null;
   }
+}
+
+export function shouldInjectWechatAttachmentPrompt(text: string): boolean {
+  const normalized = normalizeOutput(text).trim();
+  if (!normalized || normalized.includes("```wechat-attachments")) {
+    return false;
+  }
+
+  const mentionsSendIntent =
+    WECHAT_ATTACHMENT_SEND_INTENT_RE.test(normalized) ||
+    WECHAT_ATTACHMENT_SEND_INTENT_ZH_RE.test(normalized);
+  if (!mentionsSendIntent) {
+    return false;
+  }
+
+  const mentionsWechatTarget =
+    WECHAT_ATTACHMENT_TARGET_RE.test(normalized) ||
+    WECHAT_ATTACHMENT_TARGET_ZH_RE.test(normalized);
+  const mentionsFileOrMedia =
+    WECHAT_ATTACHMENT_FILE_TERM_RE.test(normalized) ||
+    WECHAT_ATTACHMENT_FILE_TERM_ZH_RE.test(normalized);
+  const mentionsLocalPath = LOCAL_ATTACHMENT_PATH_HINT_RE.test(normalized);
+  const looksLikeShortSendCommand = normalized.length <= 32;
+
+  return (
+    mentionsWechatTarget ||
+    mentionsFileOrMedia ||
+    mentionsLocalPath ||
+    looksLikeShortSendCommand
+  );
+}
+
+export function buildWechatInboundPrompt(text: string): string {
+  if (!shouldInjectWechatAttachmentPrompt(text)) {
+    return text;
+  }
+
+  const normalized = normalizeOutput(text).trim();
+  if (!normalized) {
+    return text;
+  }
+
+  return `${WECHAT_ATTACHMENT_PROMPT_PREFIX}\n${normalized}`;
 }
 
 export function parseWechatFinalReply(text: string): ParsedWechatFinalReply {
@@ -784,7 +893,7 @@ export function formatFinalReplyMessage(
 function extractInlineWechatAttachments(text: string): ParsedWechatFinalReply {
   const sanitized = text
     .replace(/\\\n\s*/g, "\\")
-    .replace(/\.\s*\n?\s*([A-Za-z0-9]{2,5})(?=\?)/g, ".$1")
+    .replace(/\.\s*\n?\s*([A-Za-z0-9]{2,8})(?=\?)/g, ".$1")
     .replace(/\?\s+/g, "?");
   const attachments: WechatReplyAttachment[] = [];
   const seenPaths = new Set<string>();
@@ -795,7 +904,7 @@ function extractInlineWechatAttachments(text: string): ParsedWechatFinalReply {
       return false;
     }
 
-    const kind = inferWechatAttachmentKind(attachmentPath);
+    const kind = inferInlineWechatAttachmentKind(attachmentPath);
     if (!kind) {
       return false;
     }
@@ -865,11 +974,11 @@ function normalizeWechatAttachmentCandidate(candidatePath: string): string {
   return candidatePath
     .trim()
     .replace(/^`|`$/g, "")
-    .replace(/\.\s+([A-Za-z0-9]{2,5})(?=$|[?/\s])/g, ".$1")
+    .replace(/\.\s+([A-Za-z0-9]{2,8})(?=$|[?/\s])/g, ".$1")
     .replace(/[\\/]+/g, path.sep);
 }
 
-function inferWechatAttachmentKind(filePath: string): WechatAttachmentKind | null {
+function inferInlineWechatAttachmentKind(filePath: string): WechatAttachmentKind | null {
   const extension = path.extname(filePath).toLowerCase();
   if (INLINE_IMAGE_EXTENSIONS.has(extension)) {
     return "image";
@@ -880,10 +989,14 @@ function inferWechatAttachmentKind(filePath: string): WechatAttachmentKind | nul
   if (INLINE_VOICE_EXTENSIONS.has(extension)) {
     return "voice";
   }
-  if (extension) {
-    return "file";
+
+  // Keep ordinary local files auto-sendable, but avoid turning common
+  // source/script references in prose into unintended WeChat uploads.
+  if (!extension || INLINE_REFERENCE_ONLY_FILE_EXTENSIONS.has(extension)) {
+    return null;
   }
-  return null;
+
+  return "file";
 }
 
 function cleanupVisibleWechatReplyText(text: string): string {
