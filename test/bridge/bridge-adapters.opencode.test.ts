@@ -374,7 +374,7 @@ describe("OpenCode permission.updated handling", () => {
       handleSseEvent(event: { type: string; properties?: unknown }): void;
     };
 
-    // handlePermissionUpdated requires a non-null client.
+    // Permission handling requires a non-null client.
     internal.client = {};
     internal.state.status = "busy";
     internal.state.activeTurnOrigin = "wechat";
@@ -467,6 +467,29 @@ describe("OpenCode permission.updated handling", () => {
 
     expect(internal.pendingPermission?.request.toolName).toBe("unknown");
   });
+
+  test("accepts v2 permission.asked events", () => {
+    const { events, internal } = createPermissionAdapter();
+
+    internal.handleSseEvent({
+      type: "permission.asked",
+      properties: {
+        id: "perm_req_123",
+        sessionID: "session_perm_1",
+        permission: "bash",
+        patterns: ["npm test"],
+        metadata: { command: "npm test" },
+      },
+    });
+
+    const approvalEvents = events.filter((e) => e.type === "approval_required");
+    expect(approvalEvents).toHaveLength(1);
+    expect(internal.pendingPermission?.permissionId).toBe("perm_req_123");
+    expect(internal.pendingPermission?.request).toMatchObject({
+      toolName: "bash",
+      commandPreview: "npm test",
+    });
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -532,6 +555,35 @@ describe("OpenCode session.created handling", () => {
 
     expect(events.filter((e) => e.type === "session_switched")).toHaveLength(0);
   });
+
+  test("updates the tracked session on session.updated", () => {
+    const adapter = new OpenCodeServerAdapter({
+      kind: "opencode",
+      command: "opencode",
+      cwd: process.cwd(),
+    });
+    const events: Array<{ type: string; sessionId?: string; source?: string }> = [];
+    adapter.setEventSink((event) => {
+      events.push(event as unknown as { type: string; sessionId?: string; source?: string });
+    });
+    const internal = adapter as unknown as {
+      state: { sharedSessionId?: string; activeRuntimeSessionId?: string };
+      activeSessionId: string | null;
+      handleSseEvent(event: { type: string; properties?: unknown }): void;
+    };
+
+    internal.activeSessionId = "session_old";
+
+    internal.handleSseEvent({
+      type: "session.updated",
+      properties: { sessionID: "session_new_2", info: { id: "session_new_2", title: "Updated session" } },
+    });
+
+    expect(internal.activeSessionId).toBe("session_new_2");
+    expect(internal.state.sharedSessionId).toBe("session_new_2");
+    expect(internal.state.activeRuntimeSessionId).toBe("session_new_2");
+    expect(events.filter((e) => e.type === "session_switched")).toHaveLength(1);
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -587,6 +639,27 @@ describe("OpenCode message.part.updated handling", () => {
     internal.handleSseEvent({
       type: "message.part.updated",
       properties: { part: { id: "p2", type: "text", text: "Content from part" } },
+    });
+
+    expect(internal.state.lastOutputAt).toBeTruthy();
+  });
+
+  test("accepts v2 message.part.delta events", () => {
+    const adapter = new OpenCodeServerAdapter({
+      kind: "opencode",
+      command: "opencode",
+      cwd: process.cwd(),
+    });
+    const internal = adapter as unknown as {
+      state: { status: string; lastOutputAt?: string };
+      handleSseEvent(event: { type: string; properties?: unknown }): void;
+    };
+
+    internal.state.status = "busy";
+
+    internal.handleSseEvent({
+      type: "message.part.delta",
+      properties: { sessionID: "s1", messageID: "m1", partID: "p1", field: "text", delta: "Hello delta" },
     });
 
     expect(internal.state.lastOutputAt).toBeTruthy();

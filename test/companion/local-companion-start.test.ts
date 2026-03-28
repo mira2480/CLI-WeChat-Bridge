@@ -3,9 +3,11 @@ import path from "node:path";
 
 import {
   buildBackgroundBridgeArgs,
+  buildForegroundClientArgs,
   isSameWorkspaceCwd,
   normalizeComparablePath,
   parseCliArgs,
+  resolveForegroundClientEntryPath,
 } from "../../src/companion/local-companion-start.ts";
 
 describe("local-companion-start helpers", () => {
@@ -74,6 +76,49 @@ describe("local-companion-start helpers", () => {
       path.resolve("./tmp/project"),
       "--lifecycle",
       "companion_bound",
+    ]);
+  });
+
+  test("resolveForegroundClientEntryPath uses the native OpenCode panel entry", () => {
+    expect(resolveForegroundClientEntryPath("codex")).toBe(
+      path.resolve(process.cwd(), "src", "companion", "local-companion.ts"),
+    );
+    expect(resolveForegroundClientEntryPath("opencode")).toBe(
+      path.resolve(process.cwd(), "src", "companion", "opencode-panel.ts"),
+    );
+  });
+
+  test("buildForegroundClientArgs omits --adapter for the OpenCode panel entry", () => {
+    const args = buildForegroundClientArgs("/tmp/opencode-panel.ts", {
+      adapter: "opencode",
+      cwd: path.resolve("./tmp/project"),
+      timeoutMs: 15000,
+    });
+
+    expect(args).toEqual([
+      "--no-warnings",
+      "--experimental-strip-types",
+      "/tmp/opencode-panel.ts",
+      "--cwd",
+      path.resolve("./tmp/project"),
+    ]);
+  });
+
+  test("buildForegroundClientArgs keeps adapter forwarding for local companions", () => {
+    const args = buildForegroundClientArgs("/tmp/local-companion.ts", {
+      adapter: "claude",
+      cwd: path.resolve("./tmp/project"),
+      timeoutMs: 15000,
+    });
+
+    expect(args).toEqual([
+      "--no-warnings",
+      "--experimental-strip-types",
+      "/tmp/local-companion.ts",
+      "--adapter",
+      "claude",
+      "--cwd",
+      path.resolve("./tmp/project"),
     ]);
   });
 

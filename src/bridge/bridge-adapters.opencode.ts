@@ -1,6 +1,4 @@
 import { spawn as spawnChildProcess, type ChildProcess } from "node:child_process";
-import { spawn as spawnPty } from "node-pty";
-import type { IPty } from "node-pty";
 
 import {
   type AdapterOptions,
@@ -11,7 +9,6 @@ import {
   OPENCODE_SESSION_IDLE_SETTLE_MS,
   OPENCODE_WECHAT_WORKING_NOTICE_DELAY_MS,
   buildCliEnvironment,
-  buildPtySpawnOptions,
   isRecord,
   describeUnknownError,
   resolveSpawnTarget,
@@ -113,6 +110,10 @@ type SdkEvent = {
   properties?: unknown;
 };
 
+const OPENCODE_DEBUG_ENABLED = /^(1|true|yes|on)$/i.test(
+  process.env.WECHAT_OPENCODE_DEBUG ?? "",
+);
+
 /* ------------------------------------------------------------------ */
 /*  Adapter                                                            */
 /* ------------------------------------------------------------------ */
@@ -127,7 +128,7 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
   private client: OpenCodeSdkClient | null = null;
   private sseAbortController: AbortController | null = null;
   private sseLoopPromise: Promise<void> | null = null;
-  private attachPty: IPty | null = null;
+  private attachProcess: ChildProcess | null = null;
   private activeSessionId: string | null = null;
   private outputBatcher: OutputBatcher;
   private shuttingDown = false;
@@ -137,6 +138,7 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
   private workingNoticeTimer: ReturnType<typeof setTimeout> | null = null;
   private workingNoticeSent = false;
   private lastBusyAtMs = 0;
+  private readonly loggedUnknownEventTypes = new Set<string>();
 
   private pendingPermission: {
     sessionId: string;
@@ -227,9 +229,7 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
     }
 
     const sessionId = await this.ensureSession();
-    this.activeSessionId = sessionId;
-    this.state.sharedSessionId = sessionId;
-    this.state.activeRuntimeSessionId = sessionId;
+    this.assignActiveSession(sessionId);
 
     try {
       const result = await this.client.session.promptAsync({
@@ -288,9 +288,7 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
       const session = this.unwrapOrThrow(
         await this.client.session.get({ path: { id: sessionId } }),
       );
-      this.activeSessionId = session.id;
-      this.state.sharedSessionId = session.id;
-      this.state.activeRuntimeSessionId = session.id;
+      this.assignActiveSession(session.id);
 
       const timestamp = nowIso();
       this.state.lastSessionSwitchAt = timestamp;
@@ -401,13 +399,13 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
     }
 
     // Stop attach process
-    if (this.attachPty) {
+    if (this.attachProcess) {
       try {
-        this.attachPty.kill();
+        this.attachProcess.kill();
       } catch {
         // Best effort.
       }
-      this.attachPty = null;
+      this.attachProcess = null;
     }
 
     // Stop server process
@@ -452,14 +450,14 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
     server.stdout?.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8").trim();
       if (text) {
-        process.stderr.write(`[opencode-serve:out] ${text}\n`);
+        this.logDebug(`[opencode-serve:out] ${text}`);
       }
     });
 
     server.stderr?.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8").trim();
       if (text) {
-        process.stderr.write(`[opencode-serve:err] ${text}\n`);
+        this.logDebug(`[opencode-serve:err] ${text}`);
       }
     });
 
@@ -517,18 +515,14 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
       const result = await this.client.session.list();
       if (result.data && result.data.length > 0) {
         const latest = result.data[0]!;
-        this.activeSessionId = latest.id;
-        this.state.sharedSessionId = latest.id;
-        this.state.activeRuntimeSessionId = latest.id;
+        this.assignActiveSession(latest.id);
       }
     } catch {
       // Session listing is optional at startup.
     }
 
     if (this.options.initialSharedSessionId) {
-      this.activeSessionId = this.options.initialSharedSessionId;
-      this.state.sharedSessionId = this.options.initialSharedSessionId;
-      this.state.activeRuntimeSessionId = this.options.initialSharedSessionId;
+      this.assignActiveSession(this.options.initialSharedSessionId);
     }
   }
 
@@ -559,8 +553,8 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
         if (this.shuttingDown) {
           return;
         }
-        process.stderr.write(
-          `[opencode-adapter:sse] Stream error: ${describeUnknownError(err)}\n`,
+        this.logDebug(
+          `[opencode-adapter:sse] Stream error: ${describeUnknownError(err)}`,
         );
       }
 
@@ -590,13 +584,19 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
         return;
       }
 
-      case "permission.updated": {
-        this.handlePermissionUpdated(event.properties);
+      case "permission.updated":
+      case "permission.asked": {
+        this.handlePermissionRequest(event.properties);
         return;
       }
 
       case "session.created": {
         this.handleSessionCreated(event.properties);
+        return;
+      }
+
+      case "session.updated": {
+        this.handleSessionUpdated(event.properties);
         return;
       }
 
@@ -611,11 +611,21 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
         return;
       }
 
+      case "message.part.delta": {
+        this.handleMessagePartDelta(event.properties);
+        return;
+      }
+
+      case "session.diff":
+      case "session.diff.delta":
+      case "session.deleted":
+      case "message.part.removed":
+      case "message.removed":
+      case "permission.replied":
+        return;
+
       default:
-        // Log unknown events for debugging but don't crash.
-        process.stderr.write(
-          `[opencode-adapter:sse] Unknown event: ${type}\n`,
-        );
+        this.logUnknownEvent(type);
         return;
     }
   }
@@ -630,11 +640,7 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
         ? properties.sessionID
         : this.activeSessionId;
 
-    if (sessionId && sessionId !== this.activeSessionId) {
-      this.activeSessionId = sessionId;
-      this.state.sharedSessionId = sessionId;
-      this.state.activeRuntimeSessionId = sessionId;
-    }
+    this.assignActiveSession(sessionId);
 
     if (this.state.status !== "busy" && this.state.status !== "awaiting_approval") {
       return;
@@ -699,8 +705,7 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
     }
   }
 
-  private handlePermissionUpdated(properties: unknown): void {
-    // properties is a Permission object: { id, sessionID, title, type, metadata, ... }
+  private handlePermissionRequest(properties: unknown): void {
     if (!isRecord(properties) || !this.client) {
       return;
     }
@@ -723,10 +728,14 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
     const toolName =
       typeof properties.type === "string"
         ? properties.type
+        : typeof properties.permission === "string"
+          ? properties.permission
         : undefined;
     const title =
       typeof properties.title === "string"
         ? properties.title
+        : typeof properties.permission === "string"
+          ? `Permission request: ${properties.permission}`
         : undefined;
     const metadata = isRecord(properties.metadata) ? properties.metadata : {};
     const command =
@@ -734,6 +743,8 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
         ? metadata.command
         : typeof metadata.detail === "string"
           ? metadata.detail
+          : Array.isArray(properties.patterns)
+            ? properties.patterns.filter((value): value is string => typeof value === "string").join(", ")
           : undefined;
 
     const code = buildOneTimeCode();
@@ -766,32 +777,39 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
   }
 
   private handleSessionCreated(properties: unknown): void {
-    // properties: { info: Session }
     if (!isRecord(properties)) {
       return;
     }
 
-    const info = properties.info;
-    if (!isRecord(info) || typeof info.id !== "string") {
+    const sessionId = this.extractSessionId(properties);
+    if (!sessionId) {
       return;
     }
 
-    const sessionId = info.id;
-    this.activeSessionId = sessionId;
-    this.state.sharedSessionId = sessionId;
-    this.state.activeRuntimeSessionId = sessionId;
+    const changed = this.assignActiveSession(sessionId);
+    if (!changed) {
+      return;
+    }
 
-    const timestamp = nowIso();
-    this.state.lastSessionSwitchAt = timestamp;
-    this.state.lastSessionSwitchSource = "local";
-    this.state.lastSessionSwitchReason = "local_follow";
-    this.emit({
-      type: "session_switched",
-      sessionId,
-      source: "local",
-      reason: "local_follow",
-      timestamp,
-    });
+    this.announceLocalSessionSwitch(sessionId);
+  }
+
+  private handleSessionUpdated(properties: unknown): void {
+    if (!isRecord(properties)) {
+      return;
+    }
+
+    const sessionId = this.extractSessionId(properties);
+    if (!sessionId) {
+      return;
+    }
+
+    const changed = this.assignActiveSession(sessionId);
+    if (!changed) {
+      return;
+    }
+
+    this.announceLocalSessionSwitch(sessionId);
   }
 
   private handleMessagePartUpdated(properties: unknown): void {
@@ -820,6 +838,24 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
       this.state.lastOutputAt = nowIso();
       this.outputBatcher.push(text);
     }
+  }
+
+  private handleMessagePartDelta(properties: unknown): void {
+    if (!isRecord(properties) || this.state.status !== "busy") {
+      return;
+    }
+
+    const delta =
+      typeof properties.delta === "string"
+        ? properties.delta
+        : undefined;
+
+    if (!delta) {
+      return;
+    }
+
+    this.state.lastOutputAt = nowIso();
+    this.outputBatcher.push(delta);
   }
 
   /* ---- Session helpers ---- */
@@ -852,9 +888,7 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
     const session = this.unwrapOrThrow(
       await this.client.session.create({ body: {} }),
     );
-    this.activeSessionId = session.id;
-    this.state.sharedSessionId = session.id;
-    this.state.activeRuntimeSessionId = session.id;
+    this.assignActiveSession(session.id);
     return session.id;
   }
 
@@ -867,25 +901,34 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
 
     try {
       const target = resolveSpawnTarget(this.options.command, this.options.kind, { env });
-      this.attachPty = spawnPty(target.file, [...target.args, ...attachArgs], {
-        ...buildPtySpawnOptions({ cwd: this.options.cwd, env }),
-        name: "xterm-color",
+      const child = spawnChildProcess(target.file, [...target.args, ...attachArgs], {
+        cwd: this.options.cwd,
+        env,
+        stdio: "inherit",
+        windowsHide: false,
       });
 
-      this.attachPty.onData((data: string) => {
-        try {
-          process.stdout.write(data);
-        } catch {
-          // Best effort local rendering.
+      this.attachProcess = child;
+
+      child.once("error", (error: Error) => {
+        if (this.attachProcess === child) {
+          this.attachProcess = null;
+          if (!this.shuttingDown) {
+            process.stderr.write(
+              `[opencode-adapter] opencode attach error: ${describeUnknownError(error)}\n`,
+            );
+          }
         }
       });
 
-      this.attachPty.onExit(() => {
-        this.attachPty = null;
-        if (!this.shuttingDown) {
-          process.stderr.write(
-            "[opencode-adapter] Local TUI (opencode attach) exited. The server is still running.\n",
-          );
+      child.once("exit", (exitCode: number | null) => {
+        if (this.attachProcess === child) {
+          this.attachProcess = null;
+          if (!this.shuttingDown) {
+            process.stderr.write(
+              `[opencode-adapter] Local TUI (opencode attach) exited with code ${exitCode ?? "unknown"}. The server is still running.\n`,
+            );
+          }
         }
       });
     } catch (err) {
@@ -893,35 +936,16 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
         `[opencode-adapter] Failed to spawn opencode attach: ${describeUnknownError(err)}\n`,
       );
     }
-
-    // Set up raw mode for stdin passthrough to the attach PTY.
-    if (process.stdin.isTTY) {
-      process.stdin.setRawMode(true);
-      process.stdin.resume();
-      process.stdin.on("data", (chunk: Buffer | string) => {
-        const data = typeof chunk === "string" ? chunk : chunk.toString("utf8");
-        this.attachPty?.write(data);
-      });
-    }
   }
 
   private detachLocalTerminal(): void {
-    if (this.attachPty) {
+    if (this.attachProcess) {
       try {
-        this.attachPty.kill();
+        this.attachProcess.kill();
       } catch {
         // Best effort.
       }
-      this.attachPty = null;
-    }
-
-    if (process.stdin.isTTY) {
-      try {
-        process.stdin.setRawMode(false);
-      } catch {
-        // Best effort.
-      }
-      process.stdin.pause();
+      this.attachProcess = null;
     }
   }
 
@@ -986,6 +1010,60 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
 
   private emit(event: BridgeEvent): void {
     this.eventSink(event);
+  }
+
+  private assignActiveSession(sessionId: string | null | undefined): boolean {
+    if (!sessionId) {
+      return false;
+    }
+
+    const changed = sessionId !== this.activeSessionId;
+    this.activeSessionId = sessionId;
+    this.state.sharedSessionId = sessionId;
+    this.state.activeRuntimeSessionId = sessionId;
+    return changed;
+  }
+
+  private extractSessionId(properties: Record<string, unknown>): string | null {
+    if (typeof properties.sessionID === "string") {
+      return properties.sessionID;
+    }
+
+    const info = properties.info;
+    if (isRecord(info) && typeof info.id === "string") {
+      return info.id;
+    }
+
+    return null;
+  }
+
+  private announceLocalSessionSwitch(sessionId: string): void {
+    const timestamp = nowIso();
+    this.state.lastSessionSwitchAt = timestamp;
+    this.state.lastSessionSwitchSource = "local";
+    this.state.lastSessionSwitchReason = "local_follow";
+    this.emit({
+      type: "session_switched",
+      sessionId,
+      source: "local",
+      reason: "local_follow",
+      timestamp,
+    });
+  }
+
+  private logDebug(message: string): void {
+    if (!OPENCODE_DEBUG_ENABLED) {
+      return;
+    }
+    process.stderr.write(`${message}\n`);
+  }
+
+  private logUnknownEvent(type: string): void {
+    if (!OPENCODE_DEBUG_ENABLED || this.loggedUnknownEventTypes.has(type)) {
+      return;
+    }
+    this.loggedUnknownEventTypes.add(type);
+    this.logDebug(`[opencode-adapter:sse] Unknown event: ${type}`);
   }
 
   private setStatus(

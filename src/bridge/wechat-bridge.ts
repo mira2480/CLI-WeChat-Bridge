@@ -182,7 +182,7 @@ export function parseCliArgs(argv: string[]): BridgeCliOptions {
   }
 
   if (!adapter) {
-    throw new Error("Missing required --adapter <codex|claude|shell>");
+    throw new Error("Missing required --adapter <codex|claude|opencode|shell>");
   }
 
   const defaultCommand = resolveDefaultAdapterCommand(adapter);
@@ -441,6 +441,10 @@ async function main(): Promise<void> {
     if (options.adapter === "codex") {
       log(
         'Start the visible Codex panel in a second terminal with: wechat-codex',
+      );
+    } else if (options.adapter === "opencode") {
+      log(
+        'Start the visible OpenCode panel in a second terminal with: wechat-opencode',
       );
     } else if (options.adapter === "claude") {
       log(

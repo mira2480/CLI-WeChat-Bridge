@@ -100,7 +100,10 @@ export function normalizeBridgeLockPayload(value: unknown): BridgeLockPayload | 
   }
 
   const adapter =
-    record.adapter === "codex" || record.adapter === "claude" || record.adapter === "shell"
+    record.adapter === "codex" ||
+    record.adapter === "claude" ||
+    record.adapter === "opencode" ||
+    record.adapter === "shell"
       ? record.adapter
       : null;
   if (!adapter) {

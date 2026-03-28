@@ -67,8 +67,8 @@ export function parseCliArgs(argv: string[]): LocalCompanionStartCliOptions {
           "       wechat-opencode-start [--cwd <path>] [--profile <name-or-path>] [--timeout-ms <ms>]",
           "       local-companion-start [--adapter <codex|claude|opencode>] [--cwd <path>] [--profile <name-or-path>] [--timeout-ms <ms>]",
           "",
-          "Starts or reuses a transient Codex or Claude bridge for the current directory, waits for the local companion endpoint, then opens the visible local companion.",
-          "Closing the visible local companion also stops that transient bridge.",
+          "Starts or reuses a transient Codex, Claude, or OpenCode bridge for the current directory, waits for the local endpoint, then opens the visible companion or panel.",
+          "Closing the visible companion or panel also stops that transient bridge.",
           "",
         ].join("\n"),
       );
@@ -239,6 +239,34 @@ export function buildBackgroundBridgeArgs(
   return args;
 }
 
+export function resolveForegroundClientEntryPath(
+  adapter: LocalCompanionLaunchAdapter,
+): string {
+  return path.resolve(
+    MODULE_DIR,
+    adapter === "opencode" ? "opencode-panel.ts" : "local-companion.ts",
+  );
+}
+
+export function buildForegroundClientArgs(
+  entryPath: string,
+  options: LocalCompanionStartCliOptions,
+): string[] {
+  const args = [
+    "--no-warnings",
+    "--experimental-strip-types",
+    entryPath,
+  ];
+
+  if (options.adapter === "opencode") {
+    args.push("--cwd", options.cwd);
+    return args;
+  }
+
+  args.push("--adapter", options.adapter, "--cwd", options.cwd);
+  return args;
+}
+
 function startBridgeInBackground(options: LocalCompanionStartCliOptions): void {
   const entryPath = path.resolve(MODULE_DIR, "..", "bridge", "wechat-bridge.ts");
   const args = buildBackgroundBridgeArgs(entryPath, options);
@@ -309,17 +337,9 @@ async function ensureBridgeReady(options: LocalCompanionStartCliOptions): Promis
   await waitForEndpoint(options.cwd, options.adapter, options.timeoutMs);
 }
 
-async function runCompanion(options: LocalCompanionStartCliOptions): Promise<number> {
-  const entryPath = path.resolve(MODULE_DIR, "local-companion.ts");
-  const args = [
-    "--no-warnings",
-    "--experimental-strip-types",
-    entryPath,
-    "--adapter",
-    options.adapter,
-    "--cwd",
-    options.cwd,
-  ];
+async function runVisibleClient(options: LocalCompanionStartCliOptions): Promise<number> {
+  const entryPath = resolveForegroundClientEntryPath(options.adapter);
+  const args = buildForegroundClientArgs(entryPath, options);
 
   return await new Promise<number>((resolve, reject) => {
     const child = spawn(process.execPath, args, {
@@ -348,7 +368,7 @@ async function main(): Promise<void> {
   }
 
   await ensureBridgeReady(options);
-  const exitCode = await runCompanion(options);
+  const exitCode = await runVisibleClient(options);
   process.exit(exitCode);
 }
 

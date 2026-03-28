@@ -21,6 +21,31 @@ describe("bridge-state lock helpers", () => {
     expect(payload?.legacyLifecycleFallback).toBe(true);
   });
 
+  test("normalizeBridgeLockPayload accepts opencode locks", () => {
+    const payload = normalizeBridgeLockPayload({
+      pid: 123,
+      parentPid: 456,
+      instanceId: "bridge-123",
+      adapter: "opencode",
+      command: "opencode",
+      cwd: "C:\\workspace",
+      startedAt: "2026-03-27T00:00:00.000Z",
+      lifecycle: "persistent",
+    });
+
+    expect(payload).toEqual({
+      pid: 123,
+      parentPid: 456,
+      instanceId: "bridge-123",
+      adapter: "opencode",
+      command: "opencode",
+      cwd: "C:\\workspace",
+      startedAt: "2026-03-27T00:00:00.000Z",
+      lifecycle: "persistent",
+      legacyLifecycleFallback: undefined,
+    });
+  });
+
   test("shouldAutoReclaimBridgeLock reclaims companion-bound locks when the parent is gone", () => {
     expect(
       shouldAutoReclaimBridgeLock(
