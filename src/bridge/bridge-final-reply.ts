@@ -2,6 +2,7 @@ import type { BridgeAdapterKind } from "./bridge-types.ts";
 import {
   formatFinalReplyMessage,
   parseWechatFinalReply,
+  sanitizeWechatFinalReplyText,
 } from "./bridge-utils.ts";
 
 export type WechatFinalReplySender = {
@@ -19,7 +20,10 @@ export async function forwardWechatFinalReply(params: {
 }): Promise<void> {
   const { adapter, rawText, sender } = params;
   const parsed = parseWechatFinalReply(rawText);
-  const visibleText = formatFinalReplyMessage(adapter, parsed.visibleText).trim();
+  const visibleText = formatFinalReplyMessage(
+    adapter,
+    sanitizeWechatFinalReplyText(adapter, parsed.visibleText),
+  ).trim();
 
   if (visibleText) {
     await sender.sendText(visibleText);

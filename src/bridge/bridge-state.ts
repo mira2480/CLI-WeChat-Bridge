@@ -36,6 +36,23 @@ export type BridgeLockPayload = {
   legacyLifecycleFallback?: true;
 };
 
+export type BridgeRuntimeOwnership =
+  | {
+      ok: true;
+      rehydratedLock: boolean;
+    }
+  | {
+      ok: false;
+      reason: "superseded";
+      activeInstanceId: string;
+    }
+  | {
+      ok: false;
+      reason: "lock_conflict";
+      activeInstanceId: string;
+      activePid: number;
+    };
+
 const ORPHAN_LOCK_RECLAIM_TIMEOUT_MS = 2_000;
 const ORPHAN_LOCK_RECLAIM_POLL_MS = 100;
 
@@ -147,6 +164,56 @@ export function shouldAutoReclaimBridgeLock(
     lock.parentPid > 1 &&
     !isProcessAlive(lock.parentPid)
   );
+}
+
+export function evaluateBridgeRuntimeOwnership(params: {
+  currentInstanceId: string;
+  currentPid: number;
+  workspaceStateInstanceId?: string;
+  lock: BridgeLockPayload | null;
+  isProcessAlive?: (pid: number) => boolean;
+}): BridgeRuntimeOwnership {
+  const isProcessAlive = params.isProcessAlive ?? isPidAlive;
+
+  if (
+    params.workspaceStateInstanceId &&
+    params.workspaceStateInstanceId !== params.currentInstanceId
+  ) {
+    return {
+      ok: false,
+      reason: "superseded",
+      activeInstanceId: params.workspaceStateInstanceId,
+    };
+  }
+
+  if (
+    params.lock &&
+    params.lock.pid === params.currentPid &&
+    params.lock.instanceId === params.currentInstanceId
+  ) {
+    return {
+      ok: true,
+      rehydratedLock: false,
+    };
+  }
+
+  if (
+    params.lock &&
+    params.lock.instanceId !== params.currentInstanceId &&
+    isProcessAlive(params.lock.pid)
+  ) {
+    return {
+      ok: false,
+      reason: "lock_conflict",
+      activeInstanceId: params.lock.instanceId,
+      activePid: params.lock.pid,
+    };
+  }
+
+  return {
+    ok: true,
+    rehydratedLock: true,
+  };
 }
 
 function buildLockConflictError(lock: BridgeLockPayload): Error {
@@ -369,6 +436,37 @@ export class BridgeStateStore {
     );
   }
 
+  verifyRuntimeOwnership(): BridgeRuntimeOwnership {
+    const workspaceState = this.readWorkspaceStateFile();
+    const ownership = evaluateBridgeRuntimeOwnership({
+      currentInstanceId: this.instanceId,
+      currentPid: process.pid,
+      workspaceStateInstanceId:
+        typeof workspaceState?.instanceId === "string"
+          ? workspaceState.instanceId
+          : undefined,
+      lock: readBridgeLockFile(),
+    });
+
+    if (!ownership.ok) {
+      return ownership;
+    }
+
+    if (!workspaceState?.instanceId) {
+      this.save();
+    }
+
+    if (ownership.rehydratedLock) {
+      fs.writeFileSync(
+        BRIDGE_LOCK_FILE,
+        JSON.stringify(this.lockPayload, null, 2),
+        "utf-8",
+      );
+    }
+
+    return ownership;
+  }
+
   private readStateFile(): Partial<BridgeState> | null {
     try {
       if (fs.existsSync(this.stateFilePath)) {
@@ -383,6 +481,20 @@ export class BridgeStateStore {
 
       return JSON.parse(
         fs.readFileSync(BRIDGE_STATE_FILE, "utf-8"),
+      ) as Partial<BridgeState>;
+    } catch {
+      return null;
+    }
+  }
+
+  private readWorkspaceStateFile(): Partial<BridgeState> | null {
+    try {
+      if (!fs.existsSync(this.stateFilePath)) {
+        return null;
+      }
+
+      return JSON.parse(
+        fs.readFileSync(this.stateFilePath, "utf-8"),
       ) as Partial<BridgeState>;
     } catch {
       return null;

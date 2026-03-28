@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  evaluateBridgeRuntimeOwnership,
   normalizeBridgeLockPayload,
   shouldAutoReclaimBridgeLock,
 } from "../../src/bridge/bridge-state.ts";
@@ -117,5 +118,83 @@ describe("bridge-state lock helpers", () => {
         (pid) => pid === 123 || pid === 456,
       ),
     ).toBe(false);
+  });
+
+  test("evaluateBridgeRuntimeOwnership yields to a newer workspace instance", () => {
+    expect(
+      evaluateBridgeRuntimeOwnership({
+        currentInstanceId: "bridge-old",
+        currentPid: 123,
+        workspaceStateInstanceId: "bridge-new",
+        lock: null,
+      }),
+    ).toEqual({
+      ok: false,
+      reason: "superseded",
+      activeInstanceId: "bridge-new",
+    });
+  });
+
+  test("evaluateBridgeRuntimeOwnership keeps the current live lock owner active", () => {
+    expect(
+      evaluateBridgeRuntimeOwnership({
+        currentInstanceId: "bridge-current",
+        currentPid: 123,
+        workspaceStateInstanceId: "bridge-current",
+        lock: {
+          pid: 123,
+          parentPid: 456,
+          instanceId: "bridge-current",
+          adapter: "opencode",
+          command: "opencode",
+          cwd: "C:\\workspace",
+          startedAt: "2026-03-27T00:00:00.000Z",
+          lifecycle: "persistent",
+        },
+      }),
+    ).toEqual({
+      ok: true,
+      rehydratedLock: false,
+    });
+  });
+
+  test("evaluateBridgeRuntimeOwnership rehydrates a missing lock for the current instance", () => {
+    expect(
+      evaluateBridgeRuntimeOwnership({
+        currentInstanceId: "bridge-current",
+        currentPid: 123,
+        workspaceStateInstanceId: "bridge-current",
+        lock: null,
+      }),
+    ).toEqual({
+      ok: true,
+      rehydratedLock: true,
+    });
+  });
+
+  test("evaluateBridgeRuntimeOwnership yields to a different live lock owner", () => {
+    expect(
+      evaluateBridgeRuntimeOwnership({
+        currentInstanceId: "bridge-current",
+        currentPid: 123,
+        workspaceStateInstanceId: "bridge-current",
+        lock: {
+          pid: 789,
+          parentPid: 456,
+          instanceId: "bridge-other",
+          adapter: "codex",
+          command: "codex",
+          cwd: "C:\\workspace",
+          startedAt: "2026-03-27T00:00:00.000Z",
+          lifecycle: "persistent",
+        },
+        isProcessAlive: (pid) => pid === 789,
+      }),
+    ).toEqual({
+      ok: false,
+      reason: "lock_conflict",
+      activeInstanceId: "bridge-other",
+      activePid: 789,
+    });
   });
 });

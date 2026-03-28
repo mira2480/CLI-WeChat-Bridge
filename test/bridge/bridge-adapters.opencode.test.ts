@@ -24,6 +24,17 @@ function wait(ms: number): Promise<void> {
 /* ------------------------------------------------------------------ */
 
 describe("OpenCode adapter factory", () => {
+  test("creates an OpenCodeServerAdapter in embedded render mode", () => {
+    const adapter = createBridgeAdapter({
+      kind: "opencode",
+      command: "opencode",
+      cwd: process.cwd(),
+      renderMode: "embedded",
+    });
+
+    expect(adapter).toBeInstanceOf(OpenCodeServerAdapter);
+  });
+
   test("creates an OpenCodeServerAdapter in companion render mode", () => {
     const adapter = createBridgeAdapter({
       kind: "opencode",
@@ -160,6 +171,7 @@ describe("OpenCode session.idle handling", () => {
       hasAcceptedInput: boolean;
       currentPreview: string;
       pendingPermission: unknown;
+      outputBatcher: { flushNow(): Promise<void>; getRecentSummary(maxLength?: number): string };
       handleSseEvent(event: { type: string; properties?: unknown }): void;
       shuttingDown: boolean;
       workingNoticeSent: boolean;
@@ -177,6 +189,11 @@ describe("OpenCode session.idle handling", () => {
   test("completes a WeChat turn after session idle with final reply", async () => {
     const { events, internal } = createBusyAdapter();
 
+    internal.handleSseEvent({
+      type: "message.part.updated",
+      properties: { part: { id: "p_idle_1", type: "text", text: "Final visible answer" } },
+    });
+
     // Real SDK: EventSessionIdle = { type: "session.idle", properties: { sessionID: string } }
     internal.handleSseEvent({
       type: "session.idle",
@@ -192,8 +209,11 @@ describe("OpenCode session.idle handling", () => {
 
     expect(statusEvents.length).toBeGreaterThanOrEqual(1);
     expect(statusEvents[statusEvents.length - 1]?.status).toBe("idle");
+    expect(finalReplyEvents).toHaveLength(1);
+    expect(finalReplyEvents[0]?.text).toBe("Final visible answer");
     expect(taskCompleteEvents).toHaveLength(1);
     expect(taskCompleteEvents[0]?.summary).toBe("Summarize the repo");
+    expect(internal.outputBatcher.getRecentSummary(500)).toBe("(no output)");
   });
 
   test("ignores session idle when not in busy status", () => {
@@ -603,6 +623,7 @@ describe("OpenCode message.part.updated handling", () => {
     });
     const internal = adapter as unknown as {
       state: { status: string; lastOutputAt?: string };
+      outputBatcher: { flushNow(): Promise<void>; getRecentSummary(maxLength?: number): string };
       handleSseEvent(event: { type: string; properties?: unknown }): void;
     };
 
@@ -631,6 +652,7 @@ describe("OpenCode message.part.updated handling", () => {
     });
     const internal = adapter as unknown as {
       state: { status: string; lastOutputAt?: string };
+      outputBatcher: { flushNow(): Promise<void>; getRecentSummary(maxLength?: number): string };
       handleSseEvent(event: { type: string; properties?: unknown }): void;
     };
 
@@ -652,6 +674,7 @@ describe("OpenCode message.part.updated handling", () => {
     });
     const internal = adapter as unknown as {
       state: { status: string; lastOutputAt?: string };
+      outputBatcher: { flushNow(): Promise<void>; getRecentSummary(maxLength?: number): string };
       handleSseEvent(event: { type: string; properties?: unknown }): void;
     };
 
@@ -677,6 +700,7 @@ describe("OpenCode message.part.updated handling", () => {
     });
     const internal = adapter as unknown as {
       state: { status: string; lastOutputAt?: string };
+      outputBatcher: { flushNow(): Promise<void>; getRecentSummary(maxLength?: number): string };
       handleSseEvent(event: { type: string; properties?: unknown }): void;
     };
 
@@ -688,6 +712,154 @@ describe("OpenCode message.part.updated handling", () => {
     });
 
     expect(internal.state.lastOutputAt).toBeUndefined();
+  });
+
+  test("ignores reasoning parts", async () => {
+    const adapter = new OpenCodeServerAdapter({
+      kind: "opencode",
+      command: "opencode",
+      cwd: process.cwd(),
+    });
+    const events: Array<{ type: string; text?: string }> = [];
+    adapter.setEventSink((event) => {
+      events.push(event as unknown as { type: string; text?: string });
+    });
+    const internal = adapter as unknown as {
+      state: { status: string; lastOutputAt?: string };
+      outputBatcher: { flushNow(): Promise<void>; getRecentSummary(maxLength?: number): string };
+      handleSseEvent(event: { type: string; properties?: unknown }): void;
+    };
+
+    internal.state.status = "busy";
+
+    internal.handleSseEvent({
+      type: "message.part.updated",
+      properties: {
+        part: {
+          id: "p_reasoning_1",
+          type: "reasoning",
+          text: "The user gave a 👌🏻 emoji which seems like an acknowledgment.",
+        },
+      },
+    });
+
+    await internal.outputBatcher.flushNow();
+
+    expect(internal.state.lastOutputAt).toBeUndefined();
+    expect(events.filter((event) => event.type === "stdout")).toHaveLength(0);
+    expect(internal.outputBatcher.getRecentSummary(500)).toBe("(no output)");
+  });
+
+  test("ignores non-text message.part.delta fields", async () => {
+    const adapter = new OpenCodeServerAdapter({
+      kind: "opencode",
+      command: "opencode",
+      cwd: process.cwd(),
+    });
+    const events: Array<{ type: string; text?: string }> = [];
+    adapter.setEventSink((event) => {
+      events.push(event as unknown as { type: string; text?: string });
+    });
+    const internal = adapter as unknown as {
+      state: { status: string; lastOutputAt?: string };
+      outputBatcher: { flushNow(): Promise<void>; getRecentSummary(maxLength?: number): string };
+      handleSseEvent(event: { type: string; properties?: unknown }): void;
+    };
+
+    internal.state.status = "busy";
+
+    internal.handleSseEvent({
+      type: "message.part.delta",
+      properties: {
+        sessionID: "s1",
+        messageID: "m1",
+        partID: "p_reasoning_delta_1",
+        field: "reasoning_content",
+        delta: "I'll respond briefly to acknowledge their input.",
+      },
+    });
+
+    await internal.outputBatcher.flushNow();
+
+    expect(internal.state.lastOutputAt).toBeUndefined();
+    expect(events.filter((event) => event.type === "stdout")).toHaveLength(0);
+    expect(internal.outputBatcher.getRecentSummary(500)).toBe("(no output)");
+  });
+
+  test("deduplicates accumulated message.part.updated snapshots", async () => {
+    const adapter = new OpenCodeServerAdapter({
+      kind: "opencode",
+      command: "opencode",
+      cwd: process.cwd(),
+    });
+    const events: Array<{ type: string; text?: string }> = [];
+    adapter.setEventSink((event) => {
+      events.push(event as unknown as { type: string; text?: string });
+    });
+    const internal = adapter as unknown as {
+      state: { status: string; lastOutputAt?: string };
+      outputBatcher: { flushNow(): Promise<void>; getRecentSummary(maxLength?: number): string };
+      handleSseEvent(event: { type: string; properties?: unknown }): void;
+    };
+
+    internal.state.status = "busy";
+
+    internal.handleSseEvent({
+      type: "message.part.updated",
+      properties: { part: { id: "p_text_1", type: "text", text: "Hello" } },
+    });
+    internal.handleSseEvent({
+      type: "message.part.updated",
+      properties: { part: { id: "p_text_1", type: "text", text: "Hello world" } },
+    });
+    internal.handleSseEvent({
+      type: "message.part.updated",
+      properties: { part: { id: "p_text_1", type: "text", text: "Hello world" } },
+    });
+
+    await internal.outputBatcher.flushNow();
+
+    expect(events.filter((event) => event.type === "stdout").map((event) => event.text).join("")).toBe("Hello world");
+    expect(internal.outputBatcher.getRecentSummary(500)).toBe("Hello world");
+  });
+
+  test("does not duplicate text when a delta is followed by a full snapshot", async () => {
+    const adapter = new OpenCodeServerAdapter({
+      kind: "opencode",
+      command: "opencode",
+      cwd: process.cwd(),
+    });
+    const events: Array<{ type: string; text?: string }> = [];
+    adapter.setEventSink((event) => {
+      events.push(event as unknown as { type: string; text?: string });
+    });
+    const internal = adapter as unknown as {
+      state: { status: string; lastOutputAt?: string };
+      outputBatcher: { flushNow(): Promise<void>; getRecentSummary(maxLength?: number): string };
+      handleSseEvent(event: { type: string; properties?: unknown }): void;
+    };
+
+    internal.state.status = "busy";
+
+    internal.handleSseEvent({
+      type: "message.part.delta",
+      properties: { sessionID: "s1", messageID: "m1", partID: "p_text_2", field: "text", delta: "Hello" },
+    });
+    internal.handleSseEvent({
+      type: "message.part.updated",
+      properties: {
+        part: {
+          id: "p_text_2",
+          type: "text",
+          text: "Hello world",
+        },
+      },
+    });
+
+    await internal.outputBatcher.flushNow();
+
+    expect(events.filter((event) => event.type === "stdout").map((event) => event.text).join("")).toBe("Hello world");
+    expect(internal.outputBatcher.getRecentSummary(500)).toBe("Hello world");
   });
 
   test("ignores message.updated events (not used for text)", () => {

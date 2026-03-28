@@ -910,6 +910,97 @@ export function formatFinalReplyMessage(
   return `${label} final reply:\n${text}`;
 }
 
+const OPENCODE_WORKING_NOTICE_RE = /^OpenCode is still working on:\s*$/i;
+const OPENCODE_TRANSIENT_NOTICE_RES = [
+  /^Bridge error: opencode companion is not connected\./i,
+  /^OpenCode session switched to \S+ from the local terminal\.$/i,
+  /^Local OpenCode input:\s*$/i,
+];
+const OPENCODE_REASONING_LINE_RES = [
+  /\bCLAUDE\.md\b/i,
+  /\bNo tool needed\.?$/i,
+  /\bThe user said\b/i,
+  /\bI need to (?:respond|reply|answer|tell the user)\b/i,
+  /\bWe need to (?:respond|reply|answer)\b/i,
+  /\bI should\b/i,
+  /\bI'll provide\b/i,
+  /^Let me (?:directly )?(?:answer|respond)\b/i,
+  /根据系统提示/i,
+  /系统提示中说/i,
+  /我需要(?:告诉用户|回答|回复)/,
+  /我们需要(?:回答|回复)/,
+  /^让我直接(?:回答|回复)/,
+  /^我要直接(?:回答|回复)/,
+  /^用户(?:说|问)了/,
+];
+
+export function sanitizeWechatFinalReplyText(
+  adapter: BridgeAdapterKind,
+  text: string,
+): string {
+  const normalized = cleanupVisibleWechatReplyText(text);
+  if (!normalized || adapter !== "opencode") {
+    return normalized;
+  }
+
+  const keptLines: string[] = [];
+  let dropNextContextLine = false;
+  let sawDroppedMeta = false;
+  let tailStartIndex = 0;
+
+  for (const rawLine of normalized.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) {
+      keptLines.push("");
+      continue;
+    }
+
+    if (dropNextContextLine) {
+      dropNextContextLine = false;
+      if (line.length <= 200) {
+        sawDroppedMeta = true;
+        tailStartIndex = keptLines.length;
+        continue;
+      }
+    }
+
+    if (OPENCODE_WORKING_NOTICE_RE.test(line)) {
+      sawDroppedMeta = true;
+      tailStartIndex = keptLines.length;
+      dropNextContextLine = true;
+      continue;
+    }
+
+    if (
+      OPENCODE_TRANSIENT_NOTICE_RES.some((pattern) => pattern.test(line)) ||
+      OPENCODE_REASONING_LINE_RES.some((pattern) => pattern.test(line))
+    ) {
+      sawDroppedMeta = true;
+      tailStartIndex = keptLines.length;
+      continue;
+    }
+
+    const previousLine = keptLines.length > 0 ? keptLines[keptLines.length - 1] : undefined;
+    if (
+      previousLine &&
+      previousLine.trim() &&
+      previousLine.trim().replace(/\s+/g, " ") === line.replace(/\s+/g, " ")
+    ) {
+      continue;
+    }
+
+    keptLines.push(line);
+  }
+
+  const cleaned = cleanupVisibleWechatReplyText(keptLines.join("\n"));
+  if (!sawDroppedMeta) {
+    return cleaned;
+  }
+
+  const tail = cleanupVisibleWechatReplyText(keptLines.slice(tailStartIndex).join("\n"));
+  return tail || cleaned;
+}
+
 function extractInlineWechatAttachments(text: string): ParsedWechatFinalReply {
   const sanitized = text
     .replace(/\\\n\s*/g, "\\")

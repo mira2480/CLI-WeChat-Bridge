@@ -30,6 +30,12 @@ import {
   buildOneTimeCode,
   OutputBatcher,
 } from "./bridge-utils.ts";
+import {
+  buildLocalCompanionToken,
+  clearLocalCompanionEndpoint,
+  writeLocalCompanionEndpoint,
+  type LocalCompanionEndpoint,
+} from "../companion/local-companion-link.ts";
 
 /* ------------------------------------------------------------------ */
 /*  Types for @opencode-ai/sdk (loose to avoid hard import-time deps) */
@@ -139,6 +145,9 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
   private workingNoticeSent = false;
   private lastBusyAtMs = 0;
   private readonly loggedUnknownEventTypes = new Set<string>();
+  private readonly emittedTextByPartId = new Map<string, string>();
+  private readonly endpointToken = buildLocalCompanionToken();
+  private endpoint: LocalCompanionEndpoint | null = null;
 
   private pendingPermission: {
     sessionId: string;
@@ -195,10 +204,13 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
       await this.checkHealth();
       await this.initializeSessions();
       this.startSseListener();
-      this.spawnAttachProcess();
 
       this.state.pid = this.serverProcess!.pid;
       this.state.startedAt = nowIso();
+      this.publishLocalEndpoint();
+      if (this.shouldSpawnAttachProcess()) {
+        this.spawnAttachProcess();
+      }
       this.setStatus("idle", "OpenCode adapter is ready.");
     } catch (err) {
       this.state.status = "error";
@@ -228,6 +240,9 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
       return;
     }
 
+    this.outputBatcher.clear();
+    this.clearStreamedPartState();
+
     const sessionId = await this.ensureSession();
     this.assignActiveSession(sessionId);
 
@@ -240,12 +255,7 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
         throw new Error(`SDK error: ${describeUnknownError(result.error)}`);
       }
     } catch (err) {
-      this.emit({
-        type: "stderr",
-        text: `Failed to send prompt: ${describeUnknownError(err)}`,
-        timestamp: nowIso(),
-      });
-      return;
+      throw new Error(`Failed to send prompt: ${describeUnknownError(err)}`);
     }
 
     this.hasAcceptedInput = true;
@@ -268,7 +278,7 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
       if (result.error !== undefined) {
         return [];
       }
-      const sessions = result.data;
+      const sessions = result.data ?? [];
       return sessions.slice(0, limit).map((s) => ({
         sessionId: s.id,
         title: truncatePreview(s.title || s.id, 120),
@@ -337,6 +347,7 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
     this.hasAcceptedInput = false;
     this.currentPreview = "(idle)";
     this.outputBatcher.clear();
+    this.clearStreamedPartState();
     await this.dispose();
     await this.start();
   }
@@ -378,7 +389,9 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
     this.shuttingDown = true;
     this.clearWechatWorkingNotice(true);
     this.detachLocalTerminal();
+    this.clearLocalEndpoint();
     this.outputBatcher.clear();
+    this.clearStreamedPartState();
 
     this.pendingPermission = null;
     this.state.pendingApproval = null;
@@ -616,10 +629,14 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
         return;
       }
 
+      case "message.part.removed": {
+        this.handleMessagePartRemoved(event.properties);
+        return;
+      }
+
       case "session.diff":
       case "session.diff.delta":
       case "session.deleted":
-      case "message.part.removed":
       case "message.removed":
       case "permission.replied":
         return;
@@ -659,25 +676,30 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
       this.state.pendingApprovalOrigin = undefined;
       this.state.activeTurnOrigin = undefined;
       this.hasAcceptedInput = false;
-      this.setStatus("idle");
+      const completedPreview = this.currentPreview;
 
-      this.outputBatcher.flushNow().then(() => {
-        const summary = this.outputBatcher.getRecentSummary(500);
-        if (summary && summary !== "(no output)") {
+      void this.outputBatcher.flushNow()
+        .catch(() => undefined)
+        .then(() => {
+          const summary = this.outputBatcher.getRecentSummary(500);
+          this.setStatus("idle");
+          if (summary && summary !== "(no output)") {
+            this.emit({
+              type: "final_reply",
+              text: summary,
+              timestamp: nowIso(),
+            });
+          }
+
           this.emit({
-            type: "final_reply",
-            text: summary,
+            type: "task_complete",
+            summary: completedPreview,
             timestamp: nowIso(),
           });
-        }
-      });
-
-      this.emit({
-        type: "task_complete",
-        summary: this.currentPreview,
-        timestamp: nowIso(),
-      });
-      this.currentPreview = "(idle)";
+          this.currentPreview = "(idle)";
+          this.outputBatcher.clear();
+          this.clearStreamedPartState();
+        });
     }, OPENCODE_SESSION_IDLE_SETTLE_MS).unref?.();
   }
 
@@ -699,6 +721,8 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
 
     if (statusType === "busy" || statusType === "running") {
       if (this.state.status === "idle") {
+        this.outputBatcher.clear();
+        this.clearStreamedPartState();
         this.lastBusyAtMs = Date.now();
         this.setStatus("busy");
       }
@@ -821,23 +845,30 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
       return;
     }
 
-    // properties: { part: Part, delta?: string }
+    const part = isRecord(properties.part) ? properties.part : undefined;
+    if (!this.isVisibleTextPart(part)) {
+      return;
+    }
+
+    const partId = this.extractPartId(properties, part);
+    if (!partId) {
+      return;
+    }
+
+    const partText =
+      typeof part.text === "string"
+        ? part.text
+        : undefined;
     const delta =
       typeof properties.delta === "string"
         ? properties.delta
         : undefined;
-
-    const part = isRecord(properties.part) ? properties.part : undefined;
-    const partText =
-      typeof part?.text === "string"
-        ? part!.text
-        : undefined;
-
-    const text = delta ?? partText;
-    if (text) {
-      this.state.lastOutputAt = nowIso();
-      this.outputBatcher.push(text);
-    }
+    const text = partText
+      ? this.consumeVisiblePartSnapshot(partId, partText)
+      : delta
+        ? this.consumeVisiblePartDelta(partId, delta)
+        : "";
+    this.pushVisibleOutput(text);
   }
 
   private handleMessagePartDelta(properties: unknown): void {
@@ -845,17 +876,35 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
       return;
     }
 
+    if (properties.field !== "text") {
+      return;
+    }
+
     const delta =
       typeof properties.delta === "string"
         ? properties.delta
         : undefined;
+    const partId = this.extractPartId(properties);
 
-    if (!delta) {
+    if (!delta || !partId) {
       return;
     }
 
-    this.state.lastOutputAt = nowIso();
-    this.outputBatcher.push(delta);
+    const text = this.consumeVisiblePartDelta(partId, delta);
+    this.pushVisibleOutput(text);
+  }
+
+  private handleMessagePartRemoved(properties: unknown): void {
+    if (!isRecord(properties)) {
+      return;
+    }
+
+    const partId = this.extractPartId(properties);
+    if (!partId) {
+      return;
+    }
+
+    this.emittedTextByPartId.delete(partId);
   }
 
   /* ---- Session helpers ---- */
@@ -1021,6 +1070,7 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
     this.activeSessionId = sessionId;
     this.state.sharedSessionId = sessionId;
     this.state.activeRuntimeSessionId = sessionId;
+    this.publishLocalEndpoint();
     return changed;
   }
 
@@ -1049,6 +1099,139 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
       reason: "local_follow",
       timestamp,
     });
+  }
+
+  private shouldPublishLocalEndpoint(): boolean {
+    return this.options.renderMode === "embedded";
+  }
+
+  private shouldSpawnAttachProcess(): boolean {
+    return this.options.renderMode === "panel" || this.options.renderMode === "companion";
+  }
+
+  private publishLocalEndpoint(): void {
+    if (!this.shouldPublishLocalEndpoint() || !this.serverPort || !this.state.startedAt) {
+      return;
+    }
+
+    const sharedSessionId = this.activeSessionId ?? this.state.sharedSessionId;
+    const payload: LocalCompanionEndpoint = {
+      instanceId: this.endpoint?.instanceId ?? `${process.pid}-${Date.now().toString(36)}`,
+      kind: this.options.kind,
+      port: this.serverPort,
+      token: this.endpointToken,
+      renderMode: "embedded",
+      bridgeOwnerPid: process.pid,
+      serverPort: this.serverPort,
+      serverUrl: this.getServerUrl(),
+      cwd: this.options.cwd,
+      command: this.options.command,
+      profile: this.options.profile,
+      sharedSessionId,
+      sharedThreadId: sharedSessionId,
+      startedAt: this.state.startedAt,
+    };
+
+    writeLocalCompanionEndpoint(payload);
+    this.endpoint = payload;
+  }
+
+  private clearLocalEndpoint(): void {
+    if (!this.shouldPublishLocalEndpoint()) {
+      return;
+    }
+
+    clearLocalCompanionEndpoint(this.options.cwd, this.endpoint?.instanceId);
+    this.endpoint = null;
+  }
+
+  private getServerUrl(): string {
+    return `http://${OPENCODE_SERVER_HOST}:${this.serverPort}`;
+  }
+
+  private isVisibleTextPart(part: Record<string, unknown> | undefined): part is SdkPart {
+    return !!part && part.type === "text" && part.ignored !== true;
+  }
+
+  private extractPartId(
+    properties: Record<string, unknown>,
+    part?: Record<string, unknown> | undefined,
+  ): string | null {
+    if (typeof properties.partID === "string") {
+      return properties.partID;
+    }
+
+    if (typeof part?.id === "string") {
+      return part.id;
+    }
+
+    return null;
+  }
+
+  private consumeVisiblePartSnapshot(partId: string, text: string): string {
+    const nextText = normalizeOutput(text);
+    if (!nextText) {
+      return "";
+    }
+
+    const previousText = this.emittedTextByPartId.get(partId) ?? "";
+    if (nextText === previousText) {
+      return "";
+    }
+
+    this.emittedTextByPartId.set(partId, nextText);
+    if (!previousText) {
+      return nextText;
+    }
+
+    if (nextText.startsWith(previousText)) {
+      return nextText.slice(previousText.length);
+    }
+
+    const sharedPrefixLength = this.getSharedPrefixLength(previousText, nextText);
+    return nextText.slice(sharedPrefixLength);
+  }
+
+  private consumeVisiblePartDelta(partId: string, delta: string): string {
+    const nextChunk = normalizeOutput(delta);
+    if (!nextChunk) {
+      return "";
+    }
+
+    const previousText = this.emittedTextByPartId.get(partId) ?? "";
+    if (nextChunk === previousText || previousText.endsWith(nextChunk)) {
+      return "";
+    }
+
+    if (previousText && nextChunk.startsWith(previousText)) {
+      this.emittedTextByPartId.set(partId, nextChunk);
+      return nextChunk.slice(previousText.length);
+    }
+
+    this.emittedTextByPartId.set(partId, `${previousText}${nextChunk}`);
+    return nextChunk;
+  }
+
+  private pushVisibleOutput(text: string): void {
+    if (!text) {
+      return;
+    }
+
+    this.state.lastOutputAt = nowIso();
+    this.outputBatcher.push(text);
+  }
+
+  private clearStreamedPartState(): void {
+    this.emittedTextByPartId.clear();
+  }
+
+  private getSharedPrefixLength(left: string, right: string): number {
+    const limit = Math.min(left.length, right.length);
+    let index = 0;
+    while (index < limit && left[index] === right[index]) {
+      index += 1;
+    }
+    return index;
   }
 
   private logDebug(message: string): void {

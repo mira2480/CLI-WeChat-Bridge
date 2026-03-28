@@ -13,6 +13,7 @@ import { BridgeStateStore } from "./bridge-state.ts";
 import type {
   BridgeAdapter,
   BridgeAdapterKind,
+  BridgeEvent,
   BridgeLifecycleMode,
   PendingApproval,
 } from "./bridge-types.ts";
@@ -101,6 +102,50 @@ function isPidAlive(pid: number): boolean {
 
 export function formatUserFacingBridgeFatalError(message: string): string {
   return `Bridge error: ${message.replace(/\s+Recent app-server log:.*$/s, "").trim()}`;
+}
+
+export function shouldForwardBridgeEventToWechat(
+  adapter: BridgeAdapterKind,
+  eventType: BridgeEvent["type"],
+): boolean {
+  if (adapter !== "opencode") {
+    return true;
+  }
+
+  switch (eventType) {
+    case "stdout":
+    case "stderr":
+    case "notice":
+    case "mirrored_user_input":
+    case "session_switched":
+    case "thread_switched":
+      return false;
+    default:
+      return true;
+  }
+}
+
+export function formatUserFacingInboundError(params: {
+  adapter: BridgeAdapterKind;
+  cwd?: string;
+  errorText: string;
+  isUserFacingShellRejection: boolean;
+}): string {
+  const { adapter, cwd, errorText, isUserFacingShellRejection } = params;
+  if (isUserFacingShellRejection) {
+    return errorText;
+  }
+
+  if (
+    adapter === "opencode" &&
+    /opencode companion is not connected/i.test(errorText)
+  ) {
+    return cwd
+      ? `OpenCode panel is not connected for bridge workspace:\n${cwd}\nRun "wechat-opencode" in that directory, or run it in your target project to replace this bridge.`
+      : 'OpenCode panel is not connected. Start "wechat-opencode" in this directory, then retry.';
+  }
+
+  return `Bridge error: ${errorText}`;
 }
 
 export function formatWechatSendFailureLogEntry(params: {
@@ -246,12 +291,40 @@ async function main(): Promise<void> {
     authorizedUserId: credentials.userId,
   });
 
+  let lockRehydratedLogged = false;
+  const ensureRuntimeOwnership = (): boolean => {
+    const ownership = stateStore.verifyRuntimeOwnership();
+    if (!ownership.ok) {
+      if (ownership.reason === "superseded") {
+        requestShutdown(
+          `Bridge instance ${stateStore.getState().instanceId} was superseded by ${ownership.activeInstanceId}. Stopping duplicate bridge.`,
+        );
+        return false;
+      }
+
+      requestShutdown(
+        `Bridge instance ${stateStore.getState().instanceId} lost the global lock to pid=${ownership.activePid} (${ownership.activeInstanceId}). Stopping duplicate bridge.`,
+      );
+      return false;
+    }
+
+    if (ownership.rehydratedLock && !lockRehydratedLogged) {
+      lockRehydratedLogged = true;
+      stateStore.appendLog(
+        `lock_rehydrated: pid=${process.pid} instanceId=${stateStore.getState().instanceId} adapter=${options.adapter} cwd=${options.cwd}`,
+      );
+    }
+
+    return true;
+  };
+
   const adapter = createBridgeAdapter({
     kind: options.adapter,
     command: options.command,
     cwd: options.cwd,
     profile: options.profile,
     lifecycle: options.lifecycle,
+    renderMode: options.adapter === "opencode" ? "embedded" : undefined,
     initialSharedSessionId:
       stateStore.getState().sharedSessionId ?? stateStore.getState().sharedThreadId,
     initialResumeConversationId: stateStore.getState().resumeConversationId,
@@ -427,6 +500,9 @@ async function main(): Promise<void> {
     });
 
     await adapter.start();
+    if (!ensureRuntimeOwnership()) {
+      return;
+    }
     syncSharedSessionState(stateStore, adapter);
     stateStore.appendLog(
       `Bridge started with adapter=${options.adapter} command=${options.command} cwd=${options.cwd}`,
@@ -457,6 +533,10 @@ async function main(): Promise<void> {
     }
 
     while (true) {
+      if (!ensureRuntimeOwnership()) {
+        break;
+      }
+
       let pollResult: Awaited<ReturnType<WeChatTransport["pollMessages"]>>;
       try {
         pollResult = await transport.pollMessages({
@@ -486,6 +566,10 @@ async function main(): Promise<void> {
         continue;
       }
 
+      if (!ensureRuntimeOwnership()) {
+        break;
+      }
+
       if (consecutivePollFailures > 0) {
         const recoveredFailures = consecutivePollFailures;
         consecutivePollFailures = 0;
@@ -501,6 +585,10 @@ async function main(): Promise<void> {
       }
 
       for (const message of pollResult.messages) {
+        if (!ensureRuntimeOwnership()) {
+          break;
+        }
+
         stateStore.touchActivity(message.createdAt);
         let nextTask: ActiveTask | null = null;
         try {
@@ -522,7 +610,12 @@ async function main(): Promise<void> {
           );
           await queueWechatMessage(
             message.senderId,
-            isUserFacingShellRejection ? errorText : `Bridge error: ${errorText}`,
+            formatUserFacingInboundError({
+              adapter: options.adapter,
+              cwd: options.cwd,
+              errorText,
+              isUserFacingShellRejection,
+            }),
             "inbound_error",
           );
         }
@@ -634,7 +727,9 @@ function wireAdapterEvents(params: {
       case "stdout":
       case "stderr":
         updateLastOutputAt();
-        outputBatcher.push(event.text);
+        if (shouldForwardBridgeEventToWechat(options.adapter, event.type)) {
+          outputBatcher.push(event.text);
+        }
         break;
       case "final_reply":
         void outputBatcher.flushNow().then(async () => {
@@ -672,9 +767,11 @@ function wireAdapterEvents(params: {
       case "notice":
         updateLastOutputAt();
         stateStore.appendLog(`${event.level}_notice: ${truncatePreview(event.text)}`);
-        void outputBatcher.flushNow().then(async () => {
-          await queueWechatMessage(authorizedUserId, event.text, "notice");
-        });
+        if (shouldForwardBridgeEventToWechat(options.adapter, event.type)) {
+          void outputBatcher.flushNow().then(async () => {
+            await queueWechatMessage(authorizedUserId, event.text, "notice");
+          });
+        }
         break;
       case "approval_required":
         void outputBatcher.flushNow().then(async () => {
@@ -695,48 +792,54 @@ function wireAdapterEvents(params: {
         });
         break;
       case "mirrored_user_input":
-        void outputBatcher.flushNow().then(async () => {
-          stateStore.appendLog(`mirrored_local_input: ${truncatePreview(event.text)}`);
-          await queueWechatMessage(
-            authorizedUserId,
-            formatMirroredUserInputMessage(options.adapter, event.text),
-            "mirrored_user_input",
-          );
-        });
+        stateStore.appendLog(`mirrored_local_input: ${truncatePreview(event.text)}`);
+        if (shouldForwardBridgeEventToWechat(options.adapter, event.type)) {
+          void outputBatcher.flushNow().then(async () => {
+            await queueWechatMessage(
+              authorizedUserId,
+              formatMirroredUserInputMessage(options.adapter, event.text),
+              "mirrored_user_input",
+            );
+          });
+        }
         break;
       case "session_switched":
         stateStore.appendLog(
           `session_switched: ${event.sessionId} source=${event.source} reason=${event.reason}`,
         );
-        void outputBatcher.flushNow().then(async () => {
-          await queueWechatMessage(
-            authorizedUserId,
-            formatSessionSwitchMessage({
-              adapter: options.adapter,
-              sessionId: event.sessionId,
-              source: event.source,
-              reason: event.reason,
-            }),
-            "session_switched",
-          );
-        });
+        if (shouldForwardBridgeEventToWechat(options.adapter, event.type)) {
+          void outputBatcher.flushNow().then(async () => {
+            await queueWechatMessage(
+              authorizedUserId,
+              formatSessionSwitchMessage({
+                adapter: options.adapter,
+                sessionId: event.sessionId,
+                source: event.source,
+                reason: event.reason,
+              }),
+              "session_switched",
+            );
+          });
+        }
         break;
       case "thread_switched":
         stateStore.appendLog(
           `thread_switched: ${event.threadId} source=${event.source} reason=${event.reason}`,
         );
-        void outputBatcher.flushNow().then(async () => {
-          await queueWechatMessage(
-            authorizedUserId,
-            formatSessionSwitchMessage({
-              adapter: options.adapter,
-              sessionId: event.threadId,
-              source: event.source,
-              reason: event.reason,
-            }),
-            "thread_switched",
-          );
-        });
+        if (shouldForwardBridgeEventToWechat(options.adapter, event.type)) {
+          void outputBatcher.flushNow().then(async () => {
+            await queueWechatMessage(
+              authorizedUserId,
+              formatSessionSwitchMessage({
+                adapter: options.adapter,
+                sessionId: event.threadId,
+                source: event.source,
+                reason: event.reason,
+              }),
+              "thread_switched",
+            );
+          });
+        }
         break;
       case "task_complete":
         void outputBatcher.flushNow().then(async () => {

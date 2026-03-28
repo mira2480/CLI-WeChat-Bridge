@@ -28,6 +28,10 @@ export type LocalCompanionEndpoint = {
   kind: BridgeAdapterKind;
   port: number;
   token: string;
+  renderMode?: "embedded" | "panel" | "companion";
+  bridgeOwnerPid?: number;
+  serverPort?: number;
+  serverUrl?: string;
   cwd: string;
   command: string;
   profile?: string;
@@ -102,6 +106,16 @@ function normalizeEndpoint(value: unknown): LocalCompanionEndpoint | null {
     kind,
     port: record.port,
     token: record.token,
+    renderMode:
+      record.renderMode === "embedded" ||
+      record.renderMode === "panel" ||
+      record.renderMode === "companion"
+        ? record.renderMode
+        : undefined,
+    bridgeOwnerPid:
+      typeof record.bridgeOwnerPid === "number" ? record.bridgeOwnerPid : undefined,
+    serverPort: typeof record.serverPort === "number" ? record.serverPort : undefined,
+    serverUrl: typeof record.serverUrl === "string" ? record.serverUrl : undefined,
     cwd: record.cwd,
     command: record.command,
     profile: typeof record.profile === "string" ? record.profile : undefined,

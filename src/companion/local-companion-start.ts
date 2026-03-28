@@ -32,6 +32,11 @@ type LocalCompanionStartCliOptions = {
   timeoutMs: number;
 };
 
+type EndpointReadResult = {
+  endpoint: LocalCompanionEndpoint | null;
+  incompatible: boolean;
+};
+
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_WAIT_TIMEOUT_MS = 15_000;
 const DEFAULT_ADAPTER: LocalCompanionLaunchAdapter = "codex";
@@ -67,8 +72,8 @@ export function parseCliArgs(argv: string[]): LocalCompanionStartCliOptions {
           "       wechat-opencode-start [--cwd <path>] [--profile <name-or-path>] [--timeout-ms <ms>]",
           "       local-companion-start [--adapter <codex|claude|opencode>] [--cwd <path>] [--profile <name-or-path>] [--timeout-ms <ms>]",
           "",
-          "Starts or reuses a transient Codex, Claude, or OpenCode bridge for the current directory, waits for the local endpoint, then opens the visible companion or panel.",
-          "Closing the visible companion or panel also stops that transient bridge.",
+          "Starts or reuses a Codex, Claude, or OpenCode bridge for the current directory, waits for the local endpoint, then opens the visible companion or panel.",
+          "Codex and Claude stay companion-bound; OpenCode stays persistent so the native panel can reattach cleanly.",
           "",
         ].join("\n"),
       );
@@ -176,9 +181,10 @@ async function isEndpointReachable(endpoint: LocalCompanionEndpoint): Promise<bo
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
   return await new Promise<boolean>((resolve) => {
+    const port = endpoint.serverPort ?? endpoint.port;
     const socket = net.connect({
       host: "127.0.0.1",
-      port: endpoint.port,
+      port,
     });
 
     let done = false;
@@ -198,28 +204,46 @@ async function isEndpointReachable(endpoint: LocalCompanionEndpoint): Promise<bo
   });
 }
 
+export function isEmbeddedOpenCodeEndpoint(endpoint: LocalCompanionEndpoint): boolean {
+  return (
+    endpoint.kind === "opencode" &&
+    endpoint.renderMode === "embedded" &&
+    (
+      (typeof endpoint.serverUrl === "string" && endpoint.serverUrl.trim().length > 0) ||
+      (typeof endpoint.serverPort === "number" && endpoint.serverPort > 0)
+    )
+  );
+}
+
 async function readUsableEndpoint(
   cwd: string,
   adapter: LocalCompanionLaunchAdapter,
-): Promise<LocalCompanionEndpoint | null> {
+): Promise<EndpointReadResult> {
   const endpoint = readLocalCompanionEndpoint(cwd);
   if (!endpoint || endpoint.kind !== adapter) {
-    return null;
+    return { endpoint: null, incompatible: false };
+  }
+
+  if (adapter === "opencode" && !isEmbeddedOpenCodeEndpoint(endpoint)) {
+    clearLocalCompanionEndpoint(cwd, endpoint.instanceId);
+    log(adapter, `Removed incompatible legacy OpenCode endpoint for ${cwd}.`);
+    return { endpoint: null, incompatible: true };
   }
 
   if (await isEndpointReachable(endpoint)) {
-    return endpoint;
+    return { endpoint, incompatible: false };
   }
 
-  clearLocalCompanionEndpoint(cwd);
+  clearLocalCompanionEndpoint(cwd, endpoint.instanceId);
   log(adapter, `Removed stale local companion endpoint for ${cwd}.`);
-  return null;
+  return { endpoint: null, incompatible: false };
 }
 
 export function buildBackgroundBridgeArgs(
   entryPath: string,
   options: LocalCompanionStartCliOptions,
 ): string[] {
+  const lifecycle = options.adapter === "opencode" ? "persistent" : "companion_bound";
   const args = [
     "--no-warnings",
     "--experimental-strip-types",
@@ -229,7 +253,7 @@ export function buildBackgroundBridgeArgs(
     "--cwd",
     options.cwd,
     "--lifecycle",
-    "companion_bound",
+    lifecycle,
   ];
 
   if (options.profile) {
@@ -290,9 +314,9 @@ async function waitForEndpoint(
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
-    const endpoint = await readUsableEndpoint(cwd, adapter);
-    if (endpoint) {
-      return endpoint;
+    const result = await readUsableEndpoint(cwd, adapter);
+    if (result.endpoint) {
+      return result.endpoint;
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
@@ -321,13 +345,28 @@ async function ensureBridgeReady(options: LocalCompanionStartCliOptions): Promis
       return;
     }
 
+    const endpointResult = await readUsableEndpoint(options.cwd, options.adapter);
+    if (options.adapter === "opencode" && endpointResult.incompatible) {
+      log(options.adapter, `Replacing incompatible OpenCode bridge for ${options.cwd}...`);
+      await stopExistingBridge(lock, options.adapter);
+      log(options.adapter, `Starting replacement bridge in background for ${options.cwd}...`);
+      startBridgeInBackground(options);
+      await waitForEndpoint(options.cwd, options.adapter, options.timeoutMs);
+      return;
+    }
+
+    if (endpointResult.endpoint) {
+      log(options.adapter, `Reusing running bridge for ${options.cwd}.`);
+      return;
+    }
+
     log(options.adapter, `Found running bridge for ${options.cwd}. Waiting for endpoint...`);
     await waitForEndpoint(options.cwd, options.adapter, options.timeoutMs);
     return;
   }
 
   const existingEndpoint = await readUsableEndpoint(options.cwd, options.adapter);
-  if (existingEndpoint) {
+  if (existingEndpoint.endpoint) {
     log(options.adapter, `Reusing running bridge for ${options.cwd}.`);
     return;
   }

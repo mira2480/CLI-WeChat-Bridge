@@ -19,13 +19,14 @@ export function createBridgeAdapter(options: AdapterOptions): BridgeAdapter {
         ? new ClaudeCompanionAdapter(options)
         : new LocalCompanionProxyAdapter(options);
     case "opencode":
-      if (options.renderMode === "panel") {
+      if (
+        options.renderMode === "embedded" ||
+        options.renderMode === "panel" ||
+        options.renderMode === "companion"
+      ) {
         return new OpenCodeServerAdapter(options);
-      } else if (options.renderMode === "companion") {
-        return new OpenCodeServerAdapter(options);
-      } else {
-        return new LocalCompanionProxyAdapter(options);
       }
+      return new LocalCompanionProxyAdapter(options);
     case "shell":
       return new ShellAdapter(options);
     default:

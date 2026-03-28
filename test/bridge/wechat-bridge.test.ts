@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  formatUserFacingInboundError,
   formatWechatSendFailureLogEntry,
   formatUserFacingBridgeFatalError,
   parseCliArgs,
+  shouldForwardBridgeEventToWechat,
   shouldWatchParentProcess,
 } from "../../src/bridge/wechat-bridge.ts";
 
@@ -73,5 +75,47 @@ describe("wechat-bridge cli helpers", () => {
     ).toBe(
       "wechat_send_failed: context=thread_switched recipient=owner@im.wechat error=Error: HTTP 503: upstream unavailable",
     );
+  });
+
+  test("formats opencode companion disconnects as a cleaner user-facing message", () => {
+    expect(
+      formatUserFacingInboundError({
+        adapter: "opencode",
+        cwd: "C:\\Users\\unlin",
+        errorText:
+          'opencode companion is not connected. Run "wechat-opencode" in a second terminal for this directory.',
+        isUserFacingShellRejection: false,
+      }),
+    ).toBe(
+      'OpenCode panel is not connected for bridge workspace:\nC:\\Users\\unlin\nRun "wechat-opencode" in that directory, or run it in your target project to replace this bridge.',
+    );
+  });
+
+  test("keeps generic inbound bridge errors for other adapters", () => {
+    expect(
+      formatUserFacingInboundError({
+        adapter: "codex",
+        errorText: "codex app-server websocket closed unexpectedly.",
+        isUserFacingShellRejection: false,
+      }),
+    ).toBe("Bridge error: codex app-server websocket closed unexpectedly.");
+  });
+
+  test("suppresses noisy OpenCode bridge events from WeChat replies", () => {
+    expect(shouldForwardBridgeEventToWechat("opencode", "stdout")).toBe(false);
+    expect(shouldForwardBridgeEventToWechat("opencode", "stderr")).toBe(false);
+    expect(shouldForwardBridgeEventToWechat("opencode", "notice")).toBe(false);
+    expect(shouldForwardBridgeEventToWechat("opencode", "mirrored_user_input")).toBe(false);
+    expect(shouldForwardBridgeEventToWechat("opencode", "session_switched")).toBe(false);
+    expect(shouldForwardBridgeEventToWechat("opencode", "thread_switched")).toBe(false);
+    expect(shouldForwardBridgeEventToWechat("opencode", "final_reply")).toBe(true);
+    expect(shouldForwardBridgeEventToWechat("opencode", "approval_required")).toBe(true);
+    expect(shouldForwardBridgeEventToWechat("opencode", "fatal_error")).toBe(true);
+  });
+
+  test("keeps non-OpenCode adapters forwarding bridge events", () => {
+    expect(shouldForwardBridgeEventToWechat("codex", "stdout")).toBe(true);
+    expect(shouldForwardBridgeEventToWechat("claude", "notice")).toBe(true);
+    expect(shouldForwardBridgeEventToWechat("shell", "stderr")).toBe(true);
   });
 });
