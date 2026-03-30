@@ -498,9 +498,12 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
       return;
     }
 
+    let listedSessions: SdkSession[] = [];
+
     try {
       const result = await this.client.session.list();
       if (result.data && result.data.length > 0) {
+        listedSessions = result.data;
         const latest = result.data[0]!;
         this.assignActiveSession(latest.id);
       }
@@ -510,10 +513,35 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
 
     if (this.options.initialSharedSessionId) {
       const restoredSessionId = this.options.initialSharedSessionId;
+      const exists = await this.hasSession(restoredSessionId, listedSessions);
+      if (!exists) {
+        return;
+      }
+
       const changed = this.assignActiveSession(restoredSessionId);
       if (changed) {
         this.recordSessionSwitch(restoredSessionId, "restore", "startup_restore");
       }
+    }
+  }
+
+  private async hasSession(
+    sessionId: string,
+    listedSessions: SdkSession[] = [],
+  ): Promise<boolean> {
+    if (!sessionId || !this.client) {
+      return false;
+    }
+
+    if (listedSessions.some((session) => session.id === sessionId)) {
+      return true;
+    }
+
+    try {
+      const result = await this.client.session.get({ path: { id: sessionId } });
+      return result.error === undefined && Boolean(result.data?.id);
+    } catch {
+      return false;
     }
   }
 
@@ -651,12 +679,10 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
       return;
     }
 
-    const sessionId =
-      typeof properties.sessionID === "string"
-        ? properties.sessionID
-        : this.activeSessionId;
-
-    this.assignActiveSession(sessionId);
+    const sessionId = this.extractSessionId(properties) ?? this.activeSessionId;
+    if (!this.syncTrackedSessionFromEvent(sessionId, { allowLocalTurnFollow: false })) {
+      return;
+    }
 
     if (this.state.status !== "busy" && this.state.status !== "awaiting_approval") {
       return;
@@ -706,6 +732,11 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
       return;
     }
 
+    const sessionId = this.extractSessionId(properties);
+    if (sessionId && !this.syncTrackedSessionFromEvent(sessionId)) {
+      return;
+    }
+
     // properties: { sessionID: string, status: { type: "busy" | "idle" | ... } }
     const status = properties.status;
     if (!isRecord(status)) {
@@ -734,6 +765,11 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
 
   private handlePermissionRequest(properties: unknown): void {
     if (!isRecord(properties) || !this.client) {
+      return;
+    }
+
+    const sessionId = this.extractSessionId(properties);
+    if (sessionId && !this.syncTrackedSessionFromEvent(sessionId)) {
       return;
     }
 
@@ -831,16 +867,9 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
     }
 
     const sessionId = this.extractSessionId(properties);
-    if (!sessionId) {
+    if (!this.syncTrackedSessionFromEvent(sessionId)) {
       return;
     }
-
-    const changed = this.assignActiveSession(sessionId);
-    if (!changed) {
-      return;
-    }
-
-    this.announceLocalSessionSwitch(sessionId);
   }
 
   private handleSessionUpdated(properties: unknown): void {
@@ -849,16 +878,7 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
     }
 
     const sessionId = this.extractSessionId(properties);
-    if (!sessionId) {
-      return;
-    }
-
-    const changed = this.assignActiveSession(sessionId);
-    if (!changed) {
-      return;
-    }
-
-    this.announceLocalSessionSwitch(sessionId);
+    this.syncTrackedSessionFromEvent(sessionId, { allowLocalTurnFollow: false });
   }
 
   private handleMessagePartUpdated(properties: unknown): void {
@@ -872,6 +892,10 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
 
     const part = isRecord(properties.part) ? properties.part : undefined;
     if (!this.isVisibleTextPart(part)) {
+      return;
+    }
+
+    if (!this.syncTrackedSessionFromEvent(part.sessionID)) {
       return;
     }
 
@@ -909,9 +933,13 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
       typeof properties.delta === "string"
         ? properties.delta
         : undefined;
+    const sessionId =
+      typeof properties.sessionID === "string"
+        ? properties.sessionID
+        : undefined;
     const partId = this.extractPartId(properties);
 
-    if (!delta || !partId) {
+    if (!delta || !partId || !this.syncTrackedSessionFromEvent(sessionId)) {
       return;
     }
 
@@ -991,16 +1019,15 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
       return;
     }
 
-    const sessionId =
-      typeof properties.sessionID === "string"
-        ? properties.sessionID
-        : undefined;
-    this.assignActiveSession(sessionId);
-
     const error = isRecord(properties.error) ? properties.error : undefined;
     const errorName = typeof error?.name === "string" ? error.name : undefined;
     const message = this.describeSessionError(error);
     if (!message) {
+      return;
+    }
+
+    const sessionId = this.extractSessionId(properties);
+    if (sessionId && !this.syncTrackedSessionFromEvent(sessionId, { allowLocalTurnFollow: false })) {
       return;
     }
 
@@ -1233,6 +1260,35 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
     return changed;
   }
 
+  private syncTrackedSessionFromEvent(
+    sessionId: string | null | undefined,
+    options: {
+      allowLocalTurnFollow?: boolean;
+    } = {},
+  ): boolean {
+    if (!sessionId) {
+      return false;
+    }
+
+    if (sessionId === this.activeSessionId) {
+      this.assignActiveSession(sessionId);
+      return true;
+    }
+
+    if (options.allowLocalTurnFollow !== false && this.shouldFollowLocalTurnSession(sessionId)) {
+      this.assignActiveSession(sessionId);
+      this.recordSessionSwitch(sessionId, "local", "local_turn", true);
+      return true;
+    }
+
+    if (!this.activeSessionId) {
+      this.assignActiveSession(sessionId);
+      return true;
+    }
+
+    return false;
+  }
+
   private extractSessionId(properties: Record<string, unknown>): string | null {
     if (typeof properties.sessionID === "string") {
       return properties.sessionID;
@@ -1246,8 +1302,12 @@ export class OpenCodeServerAdapter implements BridgeAdapter {
     return null;
   }
 
-  private announceLocalSessionSwitch(sessionId: string): void {
-    this.recordSessionSwitch(sessionId, "local", "local_follow", true);
+  private shouldFollowLocalTurnSession(sessionId: string): boolean {
+    return (
+      sessionId !== this.activeSessionId &&
+      this.state.activeTurnOrigin === "local" &&
+      this.hasTrackedTurnState()
+    );
   }
 
   private recordSessionSwitch(

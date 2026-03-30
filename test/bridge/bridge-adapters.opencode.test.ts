@@ -108,6 +108,130 @@ describe("OpenCodeServerAdapter initial state", () => {
 });
 
 /* ------------------------------------------------------------------ */
+/*  startup session restore                                            */
+/* ------------------------------------------------------------------ */
+
+describe("OpenCode startup session restore", () => {
+  function createSdkSession(id: string, title = id) {
+    return {
+      id,
+      projectID: "project_1",
+      directory: process.cwd(),
+      title,
+      version: "1",
+      time: {
+        created: Date.now(),
+        updated: Date.now(),
+      },
+    };
+  }
+
+  test("keeps the latest live session when the persisted shared session is gone", async () => {
+    const adapter = new OpenCodeServerAdapter({
+      kind: "opencode",
+      command: "opencode",
+      cwd: process.cwd(),
+      initialSharedSessionId: "session_missing",
+    });
+    const internal = adapter as unknown as {
+      client: {
+        session: {
+          list(): Promise<unknown>;
+          get(options: { path: { id: string } }): Promise<unknown>;
+        };
+      };
+      activeSessionId: string | null;
+      state: {
+        sharedSessionId?: string;
+        sharedThreadId?: string;
+        activeRuntimeSessionId?: string;
+        lastSessionSwitchSource?: string;
+        lastSessionSwitchReason?: string;
+      };
+      initializeSessions(): Promise<void>;
+    };
+
+    internal.client = {
+      session: {
+        list: async () => ({
+          data: [createSdkSession("session_live")],
+          error: undefined,
+          request: {},
+          response: {},
+        }),
+        get: async ({ path }) => ({
+          data: undefined,
+          error: path.id === "session_missing" ? new Error("Session not found") : undefined,
+          request: {},
+          response: {},
+        }),
+      },
+    };
+
+    await internal.initializeSessions();
+
+    expect(internal.activeSessionId).toBe("session_live");
+    expect(internal.state.sharedSessionId).toBe("session_live");
+    expect(internal.state.sharedThreadId).toBe("session_live");
+    expect(internal.state.activeRuntimeSessionId).toBe("session_live");
+    expect(internal.state.lastSessionSwitchSource).toBeUndefined();
+    expect(internal.state.lastSessionSwitchReason).toBeUndefined();
+  });
+
+  test("restores the persisted shared session only when the server can still load it", async () => {
+    const adapter = new OpenCodeServerAdapter({
+      kind: "opencode",
+      command: "opencode",
+      cwd: process.cwd(),
+      initialSharedSessionId: "session_restore",
+    });
+    const internal = adapter as unknown as {
+      client: {
+        session: {
+          list(): Promise<unknown>;
+          get(options: { path: { id: string } }): Promise<unknown>;
+        };
+      };
+      activeSessionId: string | null;
+      state: {
+        sharedSessionId?: string;
+        sharedThreadId?: string;
+        activeRuntimeSessionId?: string;
+        lastSessionSwitchSource?: string;
+        lastSessionSwitchReason?: string;
+      };
+      initializeSessions(): Promise<void>;
+    };
+
+    internal.client = {
+      session: {
+        list: async () => ({
+          data: [createSdkSession("session_live")],
+          error: undefined,
+          request: {},
+          response: {},
+        }),
+        get: async ({ path }) => ({
+          data: path.id === "session_restore" ? createSdkSession("session_restore") : undefined,
+          error: path.id === "session_restore" ? undefined : new Error("Session not found"),
+          request: {},
+          response: {},
+        }),
+      },
+    };
+
+    await internal.initializeSessions();
+
+    expect(internal.activeSessionId).toBe("session_restore");
+    expect(internal.state.sharedSessionId).toBe("session_restore");
+    expect(internal.state.sharedThreadId).toBe("session_restore");
+    expect(internal.state.activeRuntimeSessionId).toBe("session_restore");
+    expect(internal.state.lastSessionSwitchSource).toBe("restore");
+    expect(internal.state.lastSessionSwitchReason).toBe("startup_restore");
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /*  SSE event handling                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -195,7 +319,14 @@ describe("OpenCode session.idle handling", () => {
 
     internal.handleSseEvent({
       type: "message.part.updated",
-      properties: { part: { id: "p_idle_1", type: "text", text: "Final visible answer" } },
+      properties: {
+        part: {
+          id: "p_idle_1",
+          sessionID: "session_idle_1",
+          type: "text",
+          text: "Final visible answer",
+        },
+      },
     });
 
     // Real SDK: EventSessionIdle = { type: "session.idle", properties: { sessionID: string } }
@@ -233,7 +364,7 @@ describe("OpenCode session.idle handling", () => {
     expect(events.filter((e) => e.type === "task_complete")).toHaveLength(0);
   });
 
-  test("updates active session when idle arrives for a different session", async () => {
+  test("ignores idle signals from a foreign session", async () => {
     const { events, internal } = createBusyAdapter();
 
     internal.handleSseEvent({
@@ -241,9 +372,11 @@ describe("OpenCode session.idle handling", () => {
       properties: { sessionID: "session_new_idle" },
     });
 
-    await wait(1_800);
+    await wait(100);
 
-    expect(internal.activeSessionId).toBe("session_new_idle");
+    expect(internal.activeSessionId).toBe("session_idle_1");
+    expect(internal.state.status).toBe("busy");
+    expect(events.filter((event) => event.type === "task_complete")).toHaveLength(0);
   });
 
   test("clears pending permission after session idle", async () => {
@@ -457,6 +590,49 @@ describe("OpenCode session.error handling", () => {
     expect(internal.currentPreview).toBe("(idle)");
     expect(events.filter((event) => event.type === "task_failed")).toHaveLength(0);
   });
+
+  test("ignores session.error from a foreign session while the current turn is still active", () => {
+    const adapter = new OpenCodeServerAdapter({
+      kind: "opencode",
+      command: "opencode",
+      cwd: process.cwd(),
+    });
+    const events: Array<{ type: string }> = [];
+    adapter.setEventSink((event) => {
+      events.push(event as unknown as { type: string });
+    });
+    const internal = adapter as unknown as {
+      state: { status: string; activeTurnOrigin?: string };
+      activeSessionId: string | null;
+      hasAcceptedInput: boolean;
+      currentPreview: string;
+      handleSseEvent(event: { type: string; properties?: unknown }): void;
+    };
+
+    internal.state.status = "busy";
+    internal.state.activeTurnOrigin = "wechat";
+    internal.activeSessionId = "session_current";
+    internal.hasAcceptedInput = true;
+    internal.currentPreview = "Keep working on the current shared session";
+
+    internal.handleSseEvent({
+      type: "session.error",
+      properties: {
+        sessionID: "session_foreign",
+        error: {
+          name: "APIError",
+          data: { message: "Foreign session failed" },
+        },
+      },
+    });
+
+    expect(internal.activeSessionId).toBe("session_current");
+    expect(internal.state.status).toBe("busy");
+    expect(internal.state.activeTurnOrigin).toBe("wechat");
+    expect(internal.hasAcceptedInput).toBe(true);
+    expect(internal.currentPreview).toBe("Keep working on the current shared session");
+    expect(events).toHaveLength(0);
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -611,7 +787,7 @@ describe("OpenCode permission.updated handling", () => {
 /* ------------------------------------------------------------------ */
 
 describe("OpenCode session.created handling", () => {
-  test("emits session_switched for local session creation", () => {
+  test("follows a new local session created during a local turn", () => {
     const adapter = new OpenCodeServerAdapter({
       kind: "opencode",
       command: "opencode",
@@ -620,6 +796,58 @@ describe("OpenCode session.created handling", () => {
     const events: Array<{ type: string; sessionId?: string; source?: string }> = [];
     adapter.setEventSink((event) => {
       events.push(event as unknown as { type: string; sessionId?: string; source?: string });
+    });
+    const internal = adapter as unknown as {
+      state: {
+        status: string;
+        activeTurnOrigin?: string;
+        sharedSessionId?: string;
+        sharedThreadId?: string;
+        activeRuntimeSessionId?: string;
+        lastSessionSwitchSource?: string;
+        lastSessionSwitchReason?: string;
+      };
+      hasAcceptedInput: boolean;
+      activeSessionId: string | null;
+      handleSseEvent(event: { type: string; properties?: unknown }): void;
+    };
+
+    internal.state.status = "busy";
+    internal.state.activeTurnOrigin = "local";
+    internal.hasAcceptedInput = true;
+    internal.activeSessionId = "session_old_local";
+
+    // Real SDK: EventSessionCreated = { type: "session.created", properties: { info: Session } }
+    internal.handleSseEvent({
+      type: "session.created",
+      properties: { info: { id: "session_new_1", title: "Test session" } },
+    });
+
+    expect(internal.activeSessionId).toBe("session_new_1");
+    expect(internal.state.sharedSessionId).toBe("session_new_1");
+    expect(internal.state.sharedThreadId).toBe("session_new_1");
+    expect(internal.state.activeRuntimeSessionId).toBe("session_new_1");
+    expect(internal.state.lastSessionSwitchSource).toBe("local");
+    expect(internal.state.lastSessionSwitchReason).toBe("local_turn");
+
+    const switchEvents = events.filter((e) => e.type === "session_switched");
+    expect(switchEvents).toHaveLength(1);
+    expect(switchEvents[0]).toMatchObject({
+      sessionId: "session_new_1",
+      source: "local",
+      reason: "local_turn",
+    });
+  });
+
+  test("adopts the first observed session without claiming a local follow", () => {
+    const adapter = new OpenCodeServerAdapter({
+      kind: "opencode",
+      command: "opencode",
+      cwd: process.cwd(),
+    });
+    const events: Array<{ type: string }> = [];
+    adapter.setEventSink((event) => {
+      events.push(event as unknown as { type: string });
     });
     const internal = adapter as unknown as {
       state: {
@@ -633,26 +861,18 @@ describe("OpenCode session.created handling", () => {
       handleSseEvent(event: { type: string; properties?: unknown }): void;
     };
 
-    // Real SDK: EventSessionCreated = { type: "session.created", properties: { info: Session } }
     internal.handleSseEvent({
       type: "session.created",
-      properties: { info: { id: "session_new_1", title: "Test session" } },
+      properties: { info: { id: "session_bootstrap_1", title: "Bootstrap session" } },
     });
 
-    expect(internal.activeSessionId).toBe("session_new_1");
-    expect(internal.state.sharedSessionId).toBe("session_new_1");
-    expect(internal.state.sharedThreadId).toBe("session_new_1");
-    expect(internal.state.activeRuntimeSessionId).toBe("session_new_1");
-    expect(internal.state.lastSessionSwitchSource).toBe("local");
-    expect(internal.state.lastSessionSwitchReason).toBe("local_follow");
-
-    const switchEvents = events.filter((e) => e.type === "session_switched");
-    expect(switchEvents).toHaveLength(1);
-    expect(switchEvents[0]).toMatchObject({
-      sessionId: "session_new_1",
-      source: "local",
-      reason: "local_follow",
-    });
+    expect(internal.activeSessionId).toBe("session_bootstrap_1");
+    expect(internal.state.sharedSessionId).toBe("session_bootstrap_1");
+    expect(internal.state.sharedThreadId).toBe("session_bootstrap_1");
+    expect(internal.state.activeRuntimeSessionId).toBe("session_bootstrap_1");
+    expect(internal.state.lastSessionSwitchSource).toBeUndefined();
+    expect(internal.state.lastSessionSwitchReason).toBeUndefined();
+    expect(events.filter((event) => event.type === "session_switched")).toHaveLength(0);
   });
 
   test("ignores session.created with missing session ID", () => {
@@ -677,7 +897,7 @@ describe("OpenCode session.created handling", () => {
     expect(events.filter((e) => e.type === "session_switched")).toHaveLength(0);
   });
 
-  test("updates the tracked session on session.updated", () => {
+  test("ignores foreign session.updated events once a shared session is established", () => {
     const adapter = new OpenCodeServerAdapter({
       kind: "opencode",
       command: "opencode",
@@ -688,23 +908,34 @@ describe("OpenCode session.created handling", () => {
       events.push(event as unknown as { type: string; sessionId?: string; source?: string });
     });
     const internal = adapter as unknown as {
-      state: { sharedSessionId?: string; sharedThreadId?: string; activeRuntimeSessionId?: string };
+      state: {
+        sharedSessionId?: string;
+        sharedThreadId?: string;
+        activeRuntimeSessionId?: string;
+        lastSessionSwitchSource?: string;
+        lastSessionSwitchReason?: string;
+      };
       activeSessionId: string | null;
       handleSseEvent(event: { type: string; properties?: unknown }): void;
     };
 
     internal.activeSessionId = "session_old";
+    internal.state.sharedSessionId = "session_old";
+    internal.state.sharedThreadId = "session_old";
+    internal.state.activeRuntimeSessionId = "session_old";
 
     internal.handleSseEvent({
       type: "session.updated",
       properties: { sessionID: "session_new_2", info: { id: "session_new_2", title: "Updated session" } },
     });
 
-    expect(internal.activeSessionId).toBe("session_new_2");
-    expect(internal.state.sharedSessionId).toBe("session_new_2");
-    expect(internal.state.sharedThreadId).toBe("session_new_2");
-    expect(internal.state.activeRuntimeSessionId).toBe("session_new_2");
-    expect(events.filter((e) => e.type === "session_switched")).toHaveLength(1);
+    expect(internal.activeSessionId).toBe("session_old");
+    expect(internal.state.sharedSessionId).toBe("session_old");
+    expect(internal.state.sharedThreadId).toBe("session_old");
+    expect(internal.state.activeRuntimeSessionId).toBe("session_old");
+    expect(internal.state.lastSessionSwitchSource).toBeUndefined();
+    expect(internal.state.lastSessionSwitchReason).toBeUndefined();
+    expect(events.filter((e) => e.type === "session_switched")).toHaveLength(0);
   });
 });
 
@@ -831,16 +1062,18 @@ describe("OpenCode message.part.updated handling", () => {
     });
     const internal = adapter as unknown as {
       state: { status: string; lastOutputAt?: string };
+      activeSessionId: string | null;
       outputBatcher: { flushNow(): Promise<void>; getRecentSummary(maxLength?: number): string };
       handleSseEvent(event: { type: string; properties?: unknown }): void;
     };
 
     internal.state.status = "busy";
+    internal.activeSessionId = "s1";
 
     // Real SDK: EventMessagePartUpdated = { type: "message.part.updated", properties: { part: Part, delta?: string } }
     internal.handleSseEvent({
       type: "message.part.updated",
-      properties: { part: { id: "p1", type: "text" }, delta: "Hello from OpenCode" },
+      properties: { part: { id: "p1", sessionID: "s1", type: "text" }, delta: "Hello from OpenCode" },
     });
 
     // Output goes through OutputBatcher (1 second delay), so immediate flush
@@ -860,15 +1093,17 @@ describe("OpenCode message.part.updated handling", () => {
     });
     const internal = adapter as unknown as {
       state: { status: string; lastOutputAt?: string };
+      activeSessionId: string | null;
       outputBatcher: { flushNow(): Promise<void>; getRecentSummary(maxLength?: number): string };
       handleSseEvent(event: { type: string; properties?: unknown }): void;
     };
 
     internal.state.status = "busy";
+    internal.activeSessionId = "s1";
 
     internal.handleSseEvent({
       type: "message.part.updated",
-      properties: { part: { id: "p2", type: "text", text: "Content from part" } },
+      properties: { part: { id: "p2", sessionID: "s1", type: "text", text: "Content from part" } },
     });
 
     expect(internal.state.lastOutputAt).toBeTruthy();
@@ -882,11 +1117,13 @@ describe("OpenCode message.part.updated handling", () => {
     });
     const internal = adapter as unknown as {
       state: { status: string; lastOutputAt?: string };
+      activeSessionId: string | null;
       outputBatcher: { flushNow(): Promise<void>; getRecentSummary(maxLength?: number): string };
       handleSseEvent(event: { type: string; properties?: unknown }): void;
     };
 
     internal.state.status = "busy";
+    internal.activeSessionId = "s1";
 
     internal.handleSseEvent({
       type: "message.part.delta",
@@ -1006,23 +1243,25 @@ describe("OpenCode message.part.updated handling", () => {
     });
     const internal = adapter as unknown as {
       state: { status: string; lastOutputAt?: string };
+      activeSessionId: string | null;
       outputBatcher: { flushNow(): Promise<void>; getRecentSummary(maxLength?: number): string };
       handleSseEvent(event: { type: string; properties?: unknown }): void;
     };
 
     internal.state.status = "busy";
+    internal.activeSessionId = "s1";
 
     internal.handleSseEvent({
       type: "message.part.updated",
-      properties: { part: { id: "p_text_1", type: "text", text: "Hello" } },
+      properties: { part: { id: "p_text_1", sessionID: "s1", type: "text", text: "Hello" } },
     });
     internal.handleSseEvent({
       type: "message.part.updated",
-      properties: { part: { id: "p_text_1", type: "text", text: "Hello world" } },
+      properties: { part: { id: "p_text_1", sessionID: "s1", type: "text", text: "Hello world" } },
     });
     internal.handleSseEvent({
       type: "message.part.updated",
-      properties: { part: { id: "p_text_1", type: "text", text: "Hello world" } },
+      properties: { part: { id: "p_text_1", sessionID: "s1", type: "text", text: "Hello world" } },
     });
 
     await internal.outputBatcher.flushNow();
@@ -1043,11 +1282,13 @@ describe("OpenCode message.part.updated handling", () => {
     });
     const internal = adapter as unknown as {
       state: { status: string; lastOutputAt?: string };
+      activeSessionId: string | null;
       outputBatcher: { flushNow(): Promise<void>; getRecentSummary(maxLength?: number): string };
       handleSseEvent(event: { type: string; properties?: unknown }): void;
     };
 
     internal.state.status = "busy";
+    internal.activeSessionId = "s1";
 
     internal.handleSseEvent({
       type: "message.part.delta",
@@ -1058,6 +1299,7 @@ describe("OpenCode message.part.updated handling", () => {
       properties: {
         part: {
           id: "p_text_2",
+          sessionID: "s1",
           type: "text",
           text: "Hello world",
         },

@@ -22,7 +22,7 @@ type OpencodePanelCliOptions = {
   cwd: string;
 };
 
-function parseCliArgs(argv: string[]): OpencodePanelCliOptions {
+export function parseCliArgs(argv: string[]): OpencodePanelCliOptions {
   let cwd = process.cwd();
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -57,7 +57,7 @@ function parseCliArgs(argv: string[]): OpencodePanelCliOptions {
   return { cwd };
 }
 
-function resolveAttachUrl(endpoint: LocalCompanionEndpoint): string {
+export function resolveAttachUrl(endpoint: LocalCompanionEndpoint): string {
   if (typeof endpoint.serverUrl === "string" && endpoint.serverUrl) {
     return endpoint.serverUrl;
   }
@@ -70,6 +70,62 @@ function resolveAttachUrl(endpoint: LocalCompanionEndpoint): string {
   }
 
   return `http://${OPENCODE_SERVER_HOST}:${port}`;
+}
+
+export function resolveAttachSessionId(
+  endpoint: LocalCompanionEndpoint,
+): string | undefined {
+  const sessionId = endpoint.sharedSessionId ?? endpoint.sharedThreadId;
+  return typeof sessionId === "string" && sessionId.trim().length > 0
+    ? sessionId
+    : undefined;
+}
+
+export function buildAttachArgs(
+  endpoint: LocalCompanionEndpoint,
+): string[] {
+  const args = ["attach", resolveAttachUrl(endpoint)];
+  const sessionId = resolveAttachSessionId(endpoint);
+  if (sessionId) {
+    args.push("--session", sessionId);
+  }
+  return args;
+}
+
+type MinimalFetchResponse = {
+  ok: boolean;
+};
+
+export async function resolveValidatedAttachSessionId(
+  endpoint: LocalCompanionEndpoint,
+  fetchImpl: (input: string) => Promise<MinimalFetchResponse> = (input) =>
+    fetch(input) as Promise<MinimalFetchResponse>,
+): Promise<string | undefined> {
+  const sessionId = resolveAttachSessionId(endpoint);
+  if (!sessionId) {
+    return undefined;
+  }
+
+  try {
+    const response = await fetchImpl(
+      `${resolveAttachUrl(endpoint)}/session/${encodeURIComponent(sessionId)}`,
+    );
+    return response.ok ? sessionId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function buildValidatedAttachArgs(
+  endpoint: LocalCompanionEndpoint,
+  fetchImpl?: (input: string) => Promise<MinimalFetchResponse>,
+): Promise<string[]> {
+  const args = ["attach", resolveAttachUrl(endpoint)];
+  const sessionId = await resolveValidatedAttachSessionId(endpoint, fetchImpl);
+  if (sessionId) {
+    args.push("--session", sessionId);
+  }
+  return args;
 }
 
 async function main(): Promise<void> {
@@ -89,10 +145,17 @@ async function main(): Promise<void> {
     );
   }
 
-  const attachUrl = resolveAttachUrl(endpoint);
   const env = buildCliEnvironment("opencode");
   const target = resolveSpawnTarget(endpoint.command, "opencode", { env });
-  const child = spawn(target.file, [...target.args, "attach", attachUrl], {
+  const requestedSessionId = resolveAttachSessionId(endpoint);
+  const attachArgs = await buildValidatedAttachArgs(endpoint);
+  if (requestedSessionId && !attachArgs.includes("--session")) {
+    log(
+      `Shared OpenCode session ${requestedSessionId} is no longer available. Attaching without an explicit session.`,
+    );
+  }
+  const attachUrl = attachArgs[1] ?? resolveAttachUrl(endpoint);
+  const child = spawn(target.file, [...target.args, ...attachArgs], {
     cwd: endpoint.cwd,
     env,
     stdio: "inherit",
@@ -114,7 +177,10 @@ async function main(): Promise<void> {
   });
 }
 
-main().catch((error) => {
-  log(error instanceof Error ? error.message : String(error));
-  process.exit(1);
-});
+const isDirectRun = Boolean((import.meta as ImportMeta & { main?: boolean }).main);
+if (isDirectRun) {
+  main().catch((error) => {
+    log(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  });
+}
