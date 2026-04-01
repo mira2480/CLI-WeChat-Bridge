@@ -1100,6 +1100,57 @@ describe("Claude CLI compatibility", () => {
     await adapter.dispose();
   });
 
+  test("falls back to the Claude transcript when the Stop hook omits the final reply", async () => {
+    const tempDir = makeTempDirectory();
+    const transcriptPath = path.join(tempDir, "resume-123.jsonl");
+    writeTextFile(
+      transcriptPath,
+      [
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            role: "assistant",
+            content: [{ type: "thinking", thinking: "Inspecting repo" }],
+            stop_reason: null,
+          },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Recovered from transcript.\r\n\r\nSummary" }],
+            stop_reason: "end_turn",
+          },
+        }),
+      ].join("\n"),
+    );
+
+    const adapter = createBridgeAdapter({
+      kind: "claude",
+      command: "claude",
+      cwd: process.cwd(),
+      renderMode: "companion",
+      initialTranscriptPath: transcriptPath,
+    }) as any;
+    const events: Array<{ type: string; text?: string }> = [];
+    adapter.setEventSink((event: { type: string; text?: string }) => events.push(event));
+    adapter.renderLocalOutput = () => undefined;
+    adapter.pty = {
+      pid: 1234,
+      write() {},
+      kill() {},
+    };
+
+    await adapter.sendInput("Summarize the repo state");
+    adapter.handleClaudeStop({});
+
+    expect(events.find((event) => event.type === "final_reply")?.text).toBe(
+      "Recovered from transcript.\n\nSummary",
+    );
+
+    await adapter.dispose();
+  });
+
   test("completes a Claude compact turn even when SessionStart keeps the same session", () => {
     const adapter = createBridgeAdapter({
       kind: "claude",

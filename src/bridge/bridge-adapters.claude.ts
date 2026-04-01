@@ -9,7 +9,9 @@ import {
   buildClaudeHookSettings,
   buildClaudePermissionDecisionHookOutput,
   buildClaudePermissionApprovalRequest,
+  extractClaudeAssistantMessageText,
   extractClaudeResumeConversationId,
+  extractClaudeTranscriptFinalReply,
   findInjectedClaudePromptIndex,
   normalizeClaudeAssistantMessage,
   parseClaudeHookPayload,
@@ -939,6 +941,27 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     );
   }
 
+  private readClaudeTranscriptFinalReply(): string | null {
+    if (!this.transcriptPath) {
+      return null;
+    }
+
+    try {
+      const rawTranscript = fs.readFileSync(this.transcriptPath, "utf8");
+      return extractClaudeTranscriptFinalReply(rawTranscript);
+    } catch {
+      return null;
+    }
+  }
+
+  private resolveClaudeFinalReplyText(payload: { last_assistant_message?: string }): string {
+    return (
+      extractClaudeAssistantMessageText(payload) ||
+      this.readClaudeTranscriptFinalReply() ||
+      normalizeClaudeAssistantMessage(payload)
+    );
+  }
+
   private handleClaudeStop(payload: { last_assistant_message?: string }): void {
     this.clearWechatWorkingNotice(true);
     this.pendingCliApprovalHints = null;
@@ -951,7 +974,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     this.setStatus("idle");
     this.emit({
       type: "final_reply",
-      text: normalizeClaudeAssistantMessage(payload),
+      text: this.resolveClaudeFinalReplyText(payload),
       timestamp: nowIso(),
     });
     this.emit({

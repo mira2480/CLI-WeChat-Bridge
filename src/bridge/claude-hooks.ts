@@ -36,6 +36,15 @@ export type PendingInjectedClaudePrompt = {
 
 export type ClaudePermissionDecisionAction = "confirm" | "deny";
 
+type ClaudeTranscriptAssistantEntry = {
+  type?: string;
+  message?: {
+    role?: string;
+    content?: unknown;
+    stop_reason?: string | null;
+  };
+};
+
 type ClaudeHookScriptParams = {
   platform?: NodeJS.Platform;
   runtimeExecPath: string;
@@ -257,12 +266,80 @@ export function buildClaudePermissionDecisionHookOutput(
   });
 }
 
+export function extractClaudeAssistantMessageText(payload: ClaudeHookPayload): string {
+  return typeof payload.last_assistant_message === "string"
+    ? normalizeOutput(payload.last_assistant_message).trim()
+    : "";
+}
+
+function extractClaudeAssistantContentText(content: unknown): string {
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  const parts = content
+    .flatMap((item) => {
+      if (!item || typeof item !== "object") {
+        return [];
+      }
+
+      const candidate = item as {
+        type?: string;
+        text?: string;
+      };
+      if (candidate.type !== "text" || typeof candidate.text !== "string") {
+        return [];
+      }
+
+      const text = normalizeOutput(candidate.text).trim();
+      return text ? [text] : [];
+    });
+
+  return parts.join("\n\n").trim();
+}
+
+export function extractClaudeTranscriptFinalReply(rawTranscript: string): string | null {
+  const lines = rawTranscript.split(/\r?\n/);
+  let fallbackText: string | null = null;
+
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]?.trim();
+    if (!line) {
+      continue;
+    }
+
+    let parsed: ClaudeTranscriptAssistantEntry | null = null;
+    try {
+      parsed = JSON.parse(line) as ClaudeTranscriptAssistantEntry;
+    } catch {
+      continue;
+    }
+
+    if (!parsed || typeof parsed !== "object") {
+      continue;
+    }
+
+    if (parsed.type !== "assistant" || !parsed.message || parsed.message.role !== "assistant") {
+      continue;
+    }
+
+    const text = extractClaudeAssistantContentText(parsed.message.content);
+    if (!text) {
+      continue;
+    }
+
+    if (parsed.message.stop_reason === "end_turn") {
+      return text;
+    }
+
+    fallbackText ??= text;
+  }
+
+  return fallbackText;
+}
+
 export function normalizeClaudeAssistantMessage(payload: ClaudeHookPayload): string {
-  const text =
-    typeof payload.last_assistant_message === "string"
-      ? normalizeOutput(payload.last_assistant_message).trim()
-      : "";
-  return text || "(no final reply)";
+  return extractClaudeAssistantMessageText(payload) || "(no final reply)";
 }
 
 export function buildClaudeFailureMessage(payload: ClaudeHookPayload): string {

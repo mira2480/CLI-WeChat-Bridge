@@ -6,7 +6,9 @@ import {
   buildClaudeHookSettings,
   buildClaudePermissionDecisionHookOutput,
   buildClaudePermissionApprovalRequest,
+  extractClaudeAssistantMessageText,
   extractClaudeResumeConversationId,
+  extractClaudeTranscriptFinalReply,
   findInjectedClaudePromptIndex,
   normalizeClaudeAssistantMessage,
   parseClaudeHookPayload,
@@ -169,6 +171,53 @@ describe("normalizeClaudeAssistantMessage", () => {
         last_assistant_message: "Done.\r\n\r\nSummary",
       }),
     ).toBe("Done.\n\nSummary");
+  });
+
+  test("returns the placeholder when the hook omits the final reply", () => {
+    expect(normalizeClaudeAssistantMessage({})).toBe("(no final reply)");
+  });
+});
+
+describe("extractClaudeAssistantMessageText", () => {
+  test("returns an empty string when the hook omits the final reply", () => {
+    expect(extractClaudeAssistantMessageText({})).toBe("");
+  });
+});
+
+describe("extractClaudeTranscriptFinalReply", () => {
+  test("extracts the last end-turn assistant text from a Claude transcript", () => {
+    const transcript = [
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "Inspecting files" }],
+          stop_reason: null,
+        },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "call_1", name: "Read", input: {} }],
+          stop_reason: "tool_use",
+        },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Recovered.\r\n\r\nSummary" }],
+          stop_reason: "end_turn",
+        },
+      }),
+      JSON.stringify({
+        type: "last-prompt",
+        lastPrompt: "hello",
+      }),
+    ].join("\n");
+
+    expect(extractClaudeTranscriptFinalReply(transcript)).toBe("Recovered.\n\nSummary");
   });
 });
 
