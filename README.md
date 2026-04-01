@@ -473,6 +473,7 @@ bun test
 
 ## 致谢
 
+### 相关链接
 - [Linux DO](https://linux.do/)：学AI，上L站！
 
 - [openclaw-weixin](https://github.com/hao-ji-xing/openclaw-weixin)：支持Claude Code Channel,感谢如此迅速的开源。
@@ -484,6 +485,15 @@ bun test
 - [@anthropic-ai/sdk](https://github.com/anthropics/anthropic-sdk-typescript)：Anthropic TypeScript SDK
 
 - [qrcode-terminal](https://github.com/gtanner/qrcode-terminal)：终端二维码输出
+
+
+### 感谢支持
+
+> 感谢 issue 反馈者 和 pr 贡献者。
+
+创作不易，如感觉对您有帮助、觉得有意思，可以请喝杯奶茶。❤️
+
+<p align='center'><img src='docs\images\wechat-tip.png' width=60%></p> 
 
 ## License
 
