@@ -18,6 +18,8 @@ import type {
   BridgeAdapterKind,
   BridgeEvent,
   BridgeLifecycleMode,
+  BridgeTurnOrigin,
+  BridgeWorkerStatus,
   PendingApproval,
 } from "./bridge-types.ts";
 import {
@@ -59,6 +61,10 @@ type BridgeCliOptions = {
 type ActiveTask = {
   startedAt: number;
   inputPreview: string;
+};
+
+type DeferredInboundMessage = {
+  message: InboundWechatMessage;
 };
 
 type WechatSendContext =
@@ -184,6 +190,53 @@ function toPendingApproval(request: ApprovalRequest | PendingApproval): PendingA
     code: buildOneTimeCode(),
     createdAt: nowIso(),
   };
+}
+
+export function shouldDeferCodexInboundMessage(params: {
+  adapter: BridgeAdapterKind;
+  status: BridgeWorkerStatus;
+  activeTurnOrigin?: BridgeTurnOrigin;
+  hasPendingConfirmation: boolean;
+  hasSystemCommand: boolean;
+}): boolean {
+  return (
+    params.adapter === "codex" &&
+    !params.hasPendingConfirmation &&
+    !params.hasSystemCommand &&
+    params.activeTurnOrigin === "local" &&
+    (params.status === "busy" || params.status === "awaiting_approval")
+  );
+}
+
+export function canDrainDeferredCodexInboundQueue(params: {
+  adapter: BridgeAdapterKind;
+  deferredCount: number;
+  status: BridgeWorkerStatus;
+  activeTurnId?: string;
+  hasPendingConfirmation: boolean;
+  hasPendingApproval: boolean;
+  hasActiveTask: boolean;
+}): boolean {
+  return (
+    params.adapter === "codex" &&
+    params.deferredCount > 0 &&
+    !params.hasPendingConfirmation &&
+    !params.hasPendingApproval &&
+    !params.hasActiveTask &&
+    !params.activeTurnId &&
+    params.status !== "busy" &&
+    params.status !== "awaiting_approval"
+  );
+}
+
+export function formatDeferredCodexInboundQueueMessage(queuePosition: number): string {
+  return `Queued for delivery after the current local Codex turn finishes. Queue position: ${queuePosition}.`;
+}
+
+export function isRetryableDeferredCodexDrainError(errorText: string): boolean {
+  return /still working|approval request is pending|waiting for local terminal input/i.test(
+    errorText,
+  );
 }
 
 export function parseCliArgs(argv: string[]): BridgeCliOptions {
@@ -372,6 +425,8 @@ async function main(): Promise<void> {
   let textSendChain = Promise.resolve();
   let attachmentSendChain = Promise.resolve();
   let activeTask: ActiveTask | null = null;
+  const deferredInboundMessages: DeferredInboundMessage[] = [];
+  let drainingDeferredInboundMessages = false;
   let lastOutputAt = 0;
   let lastHeartbeatAt = 0;
   let consecutivePollFailures = 0;
@@ -414,6 +469,70 @@ async function main(): Promise<void> {
   const outputBatcher = new OutputBatcher(async (text) => {
     await queueWechatMessage(stateStore.getState().authorizedUserId, text);
   });
+  const maybeDrainDeferredInboundMessages = async (): Promise<void> => {
+    if (drainingDeferredInboundMessages || !ensureRuntimeOwnership()) {
+      return;
+    }
+
+    const adapterState = adapter.getState();
+    if (
+      !canDrainDeferredCodexInboundQueue({
+        adapter: options.adapter,
+        deferredCount: deferredInboundMessages.length,
+        status: adapterState.status,
+        activeTurnId: adapterState.activeTurnId,
+        hasPendingConfirmation: Boolean(stateStore.getState().pendingConfirmation),
+        hasPendingApproval: Boolean(adapterState.pendingApproval),
+        hasActiveTask: Boolean(activeTask),
+      })
+    ) {
+      return;
+    }
+
+    const nextDeferred = deferredInboundMessages.shift();
+    if (!nextDeferred) {
+      return;
+    }
+
+    drainingDeferredInboundMessages = true;
+    try {
+      stateStore.appendLog(
+        `draining_deferred_inbound_input: remaining=${deferredInboundMessages.length} text=${truncatePreview(nextDeferred.message.text)}`,
+      );
+      const nextTask = await dispatchInboundWechatText({
+        message: nextDeferred.message,
+        options,
+        stateStore,
+        adapter,
+      });
+      activeTask = nextTask;
+      lastHeartbeatAt = 0;
+    } catch (err) {
+      const errorText = err instanceof Error ? err.message : String(err);
+      if (isRetryableDeferredCodexDrainError(errorText)) {
+        deferredInboundMessages.unshift(nextDeferred);
+        stateStore.appendLog(
+          `deferred_inbound_blocked: ${truncatePreview(errorText, 400)}`,
+        );
+        return;
+      }
+
+      logError(errorText);
+      stateStore.appendLog(`deferred_inbound_error: ${errorText}`);
+      await queueWechatMessage(
+        nextDeferred.message.senderId,
+        formatUserFacingInboundError({
+          adapter: options.adapter,
+          cwd: options.cwd,
+          errorText,
+          isUserFacingShellRejection: false,
+        }),
+        "inbound_error",
+      );
+    } finally {
+      drainingDeferredInboundMessages = false;
+    }
+  };
   const startupParentPid = process.ppid;
   const attachedToTerminal = Boolean(
     process.stdin.isTTY || process.stdout.isTTY || process.stderr.isTTY,
@@ -524,6 +643,7 @@ async function main(): Promise<void> {
       outputBatcher,
       queueWechatAttachmentAction,
       queueWechatMessage,
+      maybeDrainDeferredInboundMessages,
       getActiveTask: () => activeTask,
       clearActiveTask: () => {
         activeTask = null;
@@ -638,6 +758,18 @@ async function main(): Promise<void> {
             adapter,
             queueWechatMessage,
             outputBatcher,
+            deferInboundMessage: async (nextMessage) => {
+              deferredInboundMessages.push({
+                message: nextMessage,
+              });
+              stateStore.appendLog(
+                `deferred_inbound_input: position=${deferredInboundMessages.length} text=${truncatePreview(nextMessage.text)}`,
+              );
+              await queueWechatMessage(
+                nextMessage.senderId,
+                formatDeferredCodexInboundQueueMessage(deferredInboundMessages.length),
+              );
+            },
           });
         } catch (err) {
           const errorText = err instanceof Error ? err.message : String(err);
@@ -663,6 +795,7 @@ async function main(): Promise<void> {
           lastHeartbeatAt = 0;
         }
         syncSharedSessionState(stateStore, adapter);
+        await maybeDrainDeferredInboundMessages();
       }
 
       const adapterState = adapter.getState();
@@ -732,6 +865,7 @@ function wireAdapterEvents(params: {
     text: string,
     context?: WechatSendContext,
   ) => Promise<void>;
+  maybeDrainDeferredInboundMessages: () => Promise<void>;
   getActiveTask: () => ActiveTask | null;
   clearActiveTask: () => void;
   updateLastOutputAt: () => void;
@@ -746,6 +880,7 @@ function wireAdapterEvents(params: {
     outputBatcher,
     queueWechatAttachmentAction,
     queueWechatMessage,
+    maybeDrainDeferredInboundMessages,
     getActiveTask,
     clearActiveTask,
     updateLastOutputAt,
@@ -802,6 +937,7 @@ function wireAdapterEvents(params: {
           log(`${event.status}: ${event.message}`);
           stateStore.appendLog(`${event.status}: ${event.message}`);
         }
+        void maybeDrainDeferredInboundMessages();
         break;
       case "notice":
         updateLastOutputAt();
@@ -875,6 +1011,7 @@ function wireAdapterEvents(params: {
             );
           });
         }
+        void maybeDrainDeferredInboundMessages();
         break;
       case "task_complete":
         void outputBatcher.flushNow().then(async () => {
@@ -889,6 +1026,7 @@ function wireAdapterEvents(params: {
             await queueWechatMessage(authorizedUserId, summary);
           }
           clearActiveTask();
+          await maybeDrainDeferredInboundMessages();
         });
         break;
       case "task_failed":
@@ -900,6 +1038,7 @@ function wireAdapterEvents(params: {
             formatTaskFailedMessage(options.adapter, event.message),
             "task_failed",
           );
+          await maybeDrainDeferredInboundMessages();
         });
         break;
       case "fatal_error":
@@ -913,6 +1052,7 @@ function wireAdapterEvents(params: {
             formatUserFacingBridgeFatalError(event.message),
             "fatal_error",
           );
+          await maybeDrainDeferredInboundMessages();
         });
         break;
       case "shutdown_requested":
@@ -954,8 +1094,17 @@ async function handleInboundMessage(params: {
     context?: WechatSendContext,
   ) => Promise<void>;
   outputBatcher: OutputBatcher;
+  deferInboundMessage: (message: InboundWechatMessage) => Promise<void>;
 }): Promise<ActiveTask | null> {
-  const { message, options, stateStore, adapter, queueWechatMessage, outputBatcher } = params;
+  const {
+    message,
+    options,
+    stateStore,
+    adapter,
+    queueWechatMessage,
+    outputBatcher,
+    deferInboundMessage,
+  } = params;
   const state = stateStore.getState();
   const systemCommand = parseWechatControlCommand(message.text, {
     adapter: options.adapter,
@@ -1081,6 +1230,19 @@ async function handleInboundMessage(params: {
   }
 
   const adapterState = adapter.getState();
+  if (
+    shouldDeferCodexInboundMessage({
+      adapter: options.adapter,
+      status: adapterState.status,
+      activeTurnOrigin: adapterState.activeTurnOrigin,
+      hasPendingConfirmation: Boolean(state.pendingConfirmation),
+      hasSystemCommand: Boolean(systemCommand),
+    })
+  ) {
+    await deferInboundMessage(message);
+    return null;
+  }
+
   if (adapterState.status === "busy") {
     if (
       (options.adapter === "codex" || options.adapter === "opencode") &&
@@ -1102,6 +1264,21 @@ async function handleInboundMessage(params: {
     return null;
   }
 
+  return dispatchInboundWechatText({
+    message,
+    options,
+    stateStore,
+    adapter,
+  });
+}
+
+async function dispatchInboundWechatText(params: {
+  message: InboundWechatMessage;
+  options: BridgeCliOptions;
+  stateStore: BridgeStateStore;
+  adapter: BridgeAdapter;
+}): Promise<ActiveTask> {
+  const { message, options, stateStore, adapter } = params;
   const activeTask = {
     startedAt: Date.now(),
     inputPreview: truncatePreview(message.text, 180),
