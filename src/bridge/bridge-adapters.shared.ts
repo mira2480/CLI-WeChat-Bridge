@@ -877,6 +877,14 @@ export function buildCliEnvironment(
       "ProgramFiles(x86)",
       "CommonProgramFiles",
       "CommonProgramFiles(x86)",
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "ALL_PROXY",
+      "http_proxy",
+      "https_proxy",
+      "all_proxy",
+      "NO_PROXY",
+      "no_proxy",
     ] as const;
 
     for (const key of keys) {
